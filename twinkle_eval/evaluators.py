@@ -2,6 +2,7 @@ import json
 import os
 import random
 import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
@@ -63,6 +64,13 @@ class Evaluator:
     def evaluate_file(self, file_path: str, timestamp: str, prompt_lang: str = "zh"):
         dataset = Dataset(file_path)
         shuffle_enabled = self.config["evaluation"].get("shuffle_options", False)
+
+        # Get metadata for JSONL output
+        model_name = self.config["model"]["name"]
+        model_version = self.config["model"].get("version", "N/A")
+        model_endpoint = self.config["llm_api"].get("base_url", "N/A")
+        eval_run_id = self.config["evaluation"].get("run_id", "N/A")
+        eval_datetime = datetime.now().isoformat()
 
         total_correct = 0
         total_questions = 0
@@ -129,6 +137,13 @@ class Evaluator:
                         "usage_completion_tokens": usage.completion_tokens,
                         "usage_prompt_tokens": usage.prompt_tokens,
                         "usage_total_tokens": usage.total_tokens,
+                        # Metadata fields
+                        "model_name": model_name,
+                        "model_version": model_version,
+                        "model_endpoint": model_endpoint,
+                        "eval_run_id": eval_run_id,
+                        "eval_datetime": eval_datetime,
+                        "dataset_source": file_path,
                     }
                 )
 
