@@ -213,7 +213,7 @@ class TwinkleEvalRunner:
             for run in range(repeat_runs):
                 try:
                     file_path_result, accuracy, result_path = evaluator.evaluate_file(
-                        file_path, f"{self.start_time}_run{run}", dataset_lang
+                        file_path, f"{self.start_time}_run{run}", dataset_lang, run_index=run
                     )
                     file_accuracies.append(accuracy)
                     file_results.append((file_path_result, accuracy, result_path))
