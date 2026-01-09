@@ -128,7 +128,7 @@ class TwinkleEvalRunner:
         """
         try:
             self.config = load_config(self.config_path)  # 載入配置
-            self.start_time = datetime.now().strftime("%Y%m%d_%H%M")  # 生成時間標記
+            self.start_time = datetime.now().strftime("%Y%m%d_%H%M%S")  # 生成時間標記
             self.start_datetime = datetime.now()  # 記錄開始時間
 
             os.makedirs(self.results_dir, exist_ok=True)  # 建立結果目錄
