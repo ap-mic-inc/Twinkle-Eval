@@ -510,6 +510,22 @@ HuggingFace 資料集下載:
         help="基準測試的最大執行時間 (秒，不指定則執行完所有請求)",
     )
 
+    # Subcommands
+    subparsers = parser.add_subparsers(dest="command", help="可用命令")
+
+    # Upload command
+    upload_parser = subparsers.add_parser("upload", help="上傳結果至 S3")
+    upload_parser.add_argument("results_dir", help="要上傳的結果目錄路徑")
+    upload_parser.add_argument("--bucket", required=True, help="S3 Bucket 名稱")
+    upload_parser.add_argument("--key", help="S3 Key Prefix (資料夾路徑)")
+    upload_parser.add_argument("--access-key", help="AWS Access Key ID")
+    upload_parser.add_argument("--secret-key", help="AWS Secret Access Key")
+    upload_parser.add_argument("--endpoint-url", help="S3 Endpoint URL")
+    upload_parser.add_argument("--region", help="AWS Region")
+    upload_parser.add_argument(
+        "--no-verify-ssl", action="store_true", help="禁用 SSL 憑證驗證 (用於自簽憑證或開發環境)"
+    )
+
     return parser
 
 
@@ -599,6 +615,38 @@ def main() -> int:
             return convert_json_to_html(args.convert_to_html)
         except Exception as e:
             print(f"❌ 轉換失敗: {e}")
+            return 1
+
+    # Upload command
+    if hasattr(args, "command") and args.command == "upload":
+        try:
+            from .s3_uploader import S3Uploader
+
+            uploader = S3Uploader(
+                aws_access_key_id=args.access_key,
+                aws_secret_access_key=args.secret_key,
+                endpoint_url=args.endpoint_url,
+                region_name=args.region,
+                verify_ssl=not args.no_verify_ssl,
+            )
+
+            print(f"🚀 開始上傳至 S3")
+            print(f"   本地目錄: {args.results_dir}")
+            print(f"   Bucket: {args.bucket}")
+            print(f"   Key Prefix: {args.key}")
+            if args.endpoint_url:
+                print(f"   Endpoint: {args.endpoint_url}")
+            if args.no_verify_ssl:
+                print(f"   ⚠️  SSL 驗證: 已停用")
+            print("-" * 60)
+
+            success = uploader.upload_directory(
+                local_dir=args.results_dir, bucket=args.bucket, prefix=args.key
+            )
+            return 0 if success else 1
+        except Exception as e:
+            print(f"❌ 上傳失敗: {e}")
+            log_error(f"S3 上傳錯誤: {e}")
             return 1
 
     # Benchmark 命令
