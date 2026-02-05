@@ -43,10 +43,10 @@ twinkle-eval --config Twinkle-Eval/twinkle_eval/config.yaml
 ```
 
 ### 步驟 5：上傳結果
-將 `results/` 目錄中的內容上傳至 S3 儲存桶。
+將 `eval_results_xxxx` 目錄中的內容上傳至 S3 儲存桶。
 **指令**:
 ```bash
-twinkle-eval upload results/ \
+twinkle-eval upload eval_results_xxxx/ \
   --bucket <bucket_name> \
   --endpoint-url <endpoint_url> \
   --access-key <access_key> \
