@@ -57,3 +57,7 @@ twinkle-eval upload eval_results_xxxx/ \
 ## 成功標準
 - 評測流程執行完畢且無錯誤。
 - 評測結果成功上傳至指定的 S3 儲存桶。
+
+## 常見問題
+- 執行要在 twinkle_eval 目錄下
+- 如果有問題應該要 cat logs/ 目錄下的日誌
