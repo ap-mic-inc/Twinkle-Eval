@@ -61,3 +61,4 @@ twinkle-eval upload eval_results_xxxx/ \
 ## 常見問題
 - 執行要在 twinkle_eval 目錄下
 - 如果有問題應該要 cat logs/ 目錄下的日誌
+- run id use summary + timestamp
