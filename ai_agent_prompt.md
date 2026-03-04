@@ -32,9 +32,12 @@ uv pip install --system -e .
 
 ### 步驟 3：下載資料集
 從 HuggingFace Hub 下載所需的資料集。
+**注意**：某些資料集需要指定 `--dataset-split train`
 **指令**:
 ```bash
 twinkle-eval --download-dataset <dataset_name>
+# 如有需要可先查詢資料集資訊
+twinkle-eval --dataset-info <dataset_name>
 ```
 
 ### 步驟 4：執行評測
@@ -45,10 +48,10 @@ twinkle-eval --config Twinkle-Eval/twinkle_eval/config.yaml
 ```
 
 ### 步驟 5：上傳結果
-將 `eval_results_xxxx` 目錄中的內容上傳至 S3 儲存桶。
+將 `results/eval_results_xxxx` 目錄中的內容上傳至 S3 儲存桶。
 **指令**:
 ```bash
-twinkle-eval upload eval_results_xxxx/ \
+twinkle-eval upload results/eval_results_xxxx/ \
   --bucket <bucket_name> \
   --endpoint-url <endpoint_url> \
   --access-key <access_key> \
@@ -64,3 +67,5 @@ twinkle-eval upload eval_results_xxxx/ \
 - 執行要在 twinkle_eval 目錄下
 - 如果有問題應該要 cat logs/ 目錄下的日誌
 - run id use summary + timestamp
+- 資料集路徑格式為 `datasets/<dataset_name>/`（HuggingFace 會將 `/` 轉為 `__`）
+- 若上傳失敗，可使用 boto3 直接上傳
