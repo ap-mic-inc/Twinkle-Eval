@@ -30,6 +30,41 @@ uv pip install --system -e .
 ### 步驟 2：設定環境
 建立或覆蓋位於 `Twinkle-Eval/twinkle_eval/config.yaml` 的設定檔。
 
+**重要**：請務必加入 `system_prompt` 設定，使用預設的中文提示詞（含 `\box{選項}` 格式），以確保模型能正確輸出答案格式。
+
+```yaml
+llm_api:
+  base_url: "<endpoint>/v1"
+  api_key: "<api_key>"
+  disable_ssl_verify: false
+  api_rate_limit: -1
+  max_retries: 5
+  timeout: 600
+
+model:
+  name: "<model_name>"
+  version: "v1.0"
+  temperature: 0.0
+  top_p: 0.9
+  max_tokens: 4096
+
+evaluation:
+  dataset_paths:
+    - "datasets/<dataset_name>/"
+  run_id: "exp-001"
+  creator: "user"
+  evaluation_method: "box"
+  system_prompt:
+    zh: |
+      使用者將提供一個題目，並附上選項 A、B、C、D
+      請仔細閱讀題目要求，根據題意選出最符合的選項，並將選項以以下格式輸出：
+      \box{選項}
+      請確保僅將選項包含在 { } 中，否則將不計算為有效答案。
+      務必精確遵循輸出格式，避免任何多餘內容或錯誤格式。
+  repeat_runs: 1
+  shuffle_options: false
+```
+
 ### 步驟 3：下載資料集
 從 HuggingFace Hub 下載所需的資料集。
 **注意**：某些資料集需要指定 `--dataset-split train`
@@ -62,6 +97,21 @@ twinkle-eval upload results/eval_results_xxxx/ \
 ## 成功標準
 - 評測流程執行完畢且無錯誤。
 - 評測結果成功上傳至指定的 S3 儲存桶。
+- 使用 `github-mcp-create_issue_comment` MCP 工具在觸發此任務的 GitHub Issue 留言回報結果。
+
+## 步驟 6：回報結果至 GitHub Issue
+
+評測完成後，使用 `github-mcp-create_issue_comment` MCP 工具留言，參數如下：
+- **owner**: `ap-mic-inc`
+- **repo**: `rd-eval-dataset-tasks`
+- **issue_number**: 請根據觸發的 Issue 編號填入
+
+留言內容需包含：
+- 評測狀態（成功 / 失敗）
+- 目標模型與資料集
+- 主要評測指標與分數
+- S3 結果路徑
+- 若失敗，附上錯誤訊息與 logs 內容
 
 ## 常見問題
 - 執行要在 twinkle_eval 目錄下
