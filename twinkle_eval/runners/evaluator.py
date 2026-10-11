@@ -53,6 +53,22 @@ def _get_reasoning_text(message: Any) -> Optional[str]:
     return reasoning
 
 
+def _tool_calls_to_extraction_source(raw_tool_calls: List[Dict[str, Any]]) -> Optional[str]:
+    """將原始 tool calls 轉為 ToolCallExtractor 的輸入（JSON 字串）。
+
+    任一呼叫的 arguments 不是合法 JSON 時回傳 None（該 sample 計為無法解析），
+    而不是讓 JSONDecodeError 中止整個檔案的評測、連帶遺失已完成的題目。
+    """
+    try:
+        calls = [
+            {"name": call["name"], "arguments": json.loads(call["arguments"] or "{}")}
+            for call in raw_tool_calls
+        ]
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return json.dumps(calls, ensure_ascii=False)
+
+
 def detect_option_keys(question_data: Dict[str, Any]) -> List[str]:
     """動態偵測題目字典中的選項鍵，依標籤順序回傳（A、B、…、Z、AA、AB、…）。
 
@@ -840,18 +856,18 @@ class Evaluator:
             for sample_id, choice in enumerate(completion.choices[: self.samples_per_question]):
                 message = choice.message
                 tool_calls = getattr(message, "tool_calls", None)
+                raw_tool_calls = [
+                    {"name": tc.function.name, "arguments": tc.function.arguments}
+                    for tc in tool_calls or []
+                ]
 
                 if tool_calls:
-                    extraction_source = json.dumps(
-                        [
-                            {
-                                "name": tc.function.name,
-                                "arguments": json.loads(tc.function.arguments),
-                            }
-                            for tc in tool_calls
-                        ],
-                        ensure_ascii=False,
-                    )
+                    extraction_source = _tool_calls_to_extraction_source(raw_tool_calls)
+                    if extraction_source is None:
+                        log_error(
+                            f"問題 {question_id} 的 tool call 參數不是合法 JSON，計為無法解析: "
+                            f"{raw_tool_calls}"
+                        )
                 else:
                     extraction_source = None
                     log_error(
@@ -875,9 +891,11 @@ class Evaluator:
                         "llm_output": json.dumps(
                             [tc.function.name for tc in tool_calls] if tool_calls else [],
                         ),
-                        "llm_reasoning_output": None,
+                        "llm_reasoning_output": _get_reasoning_text(message),
                         "predicted_answer": predicted_answer,
                         "is_correct": is_correct,
+                        # 模型回傳的原始 tool calls（arguments 為未解析的字串），供除錯參數格式錯誤
+                        "tool_calls": raw_tool_calls,
                         **self._usage_fields(usage),
                     },
                 )

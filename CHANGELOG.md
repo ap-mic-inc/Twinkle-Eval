@@ -79,6 +79,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 開啟 Google Drive 上傳時，本次評測的 log 檔一定會被上傳：先前以 runner 的時間戳比對 log
   檔名，而 log 檔的時間戳在 import 時決定，兩者不在同一秒（秒級時間戳下）就會漏傳
 
+- **BFCL FC（`bfcl_fc`）遇到不合法的 tool call 參數不再中止整個檔案**：先前一題的 arguments
+  不是合法 JSON 就會拋出例外，該檔案已完成的題目也一併遺失。現在該題計為無法解析，
+  原始 tool calls 保存在 JSONL 新增的 `tool_calls` 欄位；arguments 為空字串時視為沒有參數
+- **BFCL FC 保存推理內容**：`llm_reasoning_output` 先前固定為 null，現在與其他路徑一樣
+  讀取 `message.reasoning` / `reasoning_content`
+- **`--download-dataset bfcl` 可以使用了**：HF repo 只有原始的 `BFCL_v3_*.json`，`load_dataset`
+  無法讀取，下載一律失敗。現在逐檔下載題目與答案並以 `merge_bfcl_files` 合併為
+  `datasets/bfcl/{category}.jsonl`（8 個單輪 AST 類別，共 2,350 題）
+
 ### Removed
 - `twinkle_eval.core.Registry`：匯出但從未被使用（各工廠有自己的註冊表）
 - `core/validators.py` 的 `validate_dataset_content` 與 `RuntimeValidator`：沒有任何呼叫端，
