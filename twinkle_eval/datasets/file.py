@@ -340,10 +340,14 @@ def _download_single_subset(
             )
             hf_dataset.to_parquet(f"{dataset_dir}/{subset}.parquet")
         else:
-            log_warning(
-                f"split '{split}' 不存在於 {dataset_name} ({subset})，"
-                f"改為下載所有 splits: {available_splits}"
+            notice = (
+                f"⚠️  split '{split}' 不存在於 {dataset_name} ({subset})，"
+                f"改為下載所有 splits: {available_splits}。"
+                "下載目錄中的所有檔案都會被評測，若含 train 等非評測用 split 請自行移除"
             )
+            # logger 只寫入 logs/ 檔案，這個提示會影響評測範圍，必須讓使用者在終端機看到
+            print(notice)
+            log_warning(notice)
             for actual_split in available_splits:
                 hf_dataset = load_dataset(
                     dataset_name,

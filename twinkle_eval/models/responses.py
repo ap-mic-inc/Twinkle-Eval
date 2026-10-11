@@ -165,7 +165,7 @@ class OpenAIResponsesModel(OpenAIModel):
                 Choice.construct(
                     index=idx,
                     message=message,
-                    finish_reason="stop",
+                    finish_reason=self._finish_reason(response, tool_calls),
                 )
             )
 
@@ -195,6 +195,20 @@ class OpenAIResponsesModel(OpenAIModel):
             usage=merged_usage,
         )
 
+    @staticmethod
+    def _finish_reason(response: Any, tool_calls: Optional[List[Any]]) -> str:
+        """將 Responses API 的結束狀態對應到 Chat Completions 的 finish_reason。"""
+        if getattr(response, "status", None) == "incomplete":
+            details = getattr(response, "incomplete_details", None)
+            reason = getattr(details, "reason", None)
+            if reason == "max_output_tokens":
+                return "length"
+            if reason == "content_filter":
+                return "content_filter"
+        if tool_calls:
+            return "tool_calls"
+        return "stop"
+
     def call(
         self,
         question_text: str,
@@ -221,10 +235,13 @@ class OpenAIResponsesModel(OpenAIModel):
         payload: Dict[str, Any] = {
             "model": model_config["name"],
             "input": input_items,
-            "temperature": overrides.get("temperature", model_config["temperature"]),
-            "top_p": overrides.get("top_p", model_config["top_p"]),
             "max_output_tokens": overrides.get("max_tokens", model_config["max_tokens"]),
         }
+        # temperature / top_p 為 null 時不送出：OpenAI 推理模型（o 系列等）不接受這兩個參數
+        for param in ("temperature", "top_p"):
+            value = overrides.get(param, model_config.get(param))
+            if value is not None:
+                payload[param] = value
 
         if instructions:
             payload["instructions"] = instructions

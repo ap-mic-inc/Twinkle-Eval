@@ -96,3 +96,25 @@ class TestConvertJsonlToExcel:
         cell = df.iloc[0]["llm_output"]
         assert len(cell) <= 32767
         assert "\x00" not in cell
+
+
+def test_formula_like_strings_are_written_as_text(tmp_path):
+    """ "=" 開頭的模型輸出不得被寫成 Excel 公式（formula injection）。"""
+    from openpyxl import load_workbook
+
+    path = tmp_path / "eval_results_20260101_000000_run0.jsonl"
+    row = {
+        "file": "d.jsonl",
+        "question_id": 0,
+        "question": "=1+1",
+        "llm_output": '=HYPERLINK("http://example.com","click")',
+        "is_correct": False,
+    }
+    path.write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+
+    assert convert_jsonl_to_excel(str(path)) == 0
+
+    ws = load_workbook(str(path).replace(".jsonl", ".xlsx")).active
+    cells = {c.value: c.data_type for c in ws[2]}
+    assert cells["=1+1"] == "s"
+    assert cells['=HYPERLINK("http://example.com","click")'] == "s"

@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 from tqdm import tqdm
 
 from twinkle_eval.core.abc import Extractor, Scorer
-from twinkle_eval.core.exceptions import ConfigurationError, EvaluationError
+from twinkle_eval.core.exceptions import EvaluationError
 from twinkle_eval.core.logger import log_error, log_warning
 from twinkle_eval.core.prompts import resolve_system_prompt
 from twinkle_eval.datasets import Dataset, index_to_label
@@ -393,16 +393,8 @@ class Evaluator:
         self.pass_k = max(1, int(pass_k))
         self.shuffle_options = bool(shuffle_options)
         self.model_overrides = model_overrides or {}
-        # max_workers 未設定（null / 0 / 負值）時交由 ThreadPoolExecutor 使用預設值
-        max_workers = self.config["llm_api"].get("max_workers")
-        try:
-            self._max_workers: Optional[int] = (
-                int(max_workers) if max_workers and int(max_workers) > 0 else None
-            )
-        except (TypeError, ValueError) as e:
-            raise ConfigurationError(
-                f"llm_api.max_workers 必須是正整數或 null，目前為 {max_workers!r}"
-            ) from e
+        # max_workers 已由 ConfigValidator 檢查（正整數或 null）；null 時使用 ThreadPoolExecutor 預設值
+        self._max_workers: Optional[int] = self.config["llm_api"].get("max_workers") or None
 
     # ── 共用輔助 ────────────────────────────────────────────────────────────
 

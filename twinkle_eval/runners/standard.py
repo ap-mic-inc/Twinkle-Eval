@@ -47,9 +47,12 @@ class TwinkleEvalRunner:
         """
         try:
             self.config = load_config(self.config_path)  # 載入配置
-            self.start_time = datetime.now().strftime(
-                "%Y%m%d_%H%M%S"
-            )  # 生成時間標記（秒級，避免同分鐘的兩次評測互相覆蓋）
+            # 時間標記（秒級，避免同分鐘的兩次評測互相覆蓋）。分散式腳本
+            # （scripts/run_slurm_*.sh）會以 TWINKLE_EVAL_RUN_TIMESTAMP 指定，讓各節點
+            # 寫入同一組檔名，之後才能以該時間戳執行 --finalize-results
+            self.start_time = os.environ.get(
+                "TWINKLE_EVAL_RUN_TIMESTAMP"
+            ) or datetime.now().strftime("%Y%m%d_%H%M%S")
             self.start_datetime = datetime.now()  # 記錄開始時間
 
             os.makedirs(self.results_dir, exist_ok=True)  # 建立結果目錄

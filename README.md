@@ -316,7 +316,7 @@ results = runner.run_evaluation(export_formats=["json", "csv"])
 | `--config PATH` | 指定設定檔路徑 |
 | `--init [NAME]` | 產生設定範本（無參數列出所有範本） |
 | `--download-dataset NAME [NAME ...]` | 下載評測資料集（支援短名稱、HuggingFace ID、`all`、`list`） |
-| `--validate` | 驗證設定檔格式與資料集路徑 |
+| `--validate` | 驗證設定檔格式與資料集路徑，並對 API 端點試打一次 |
 | `--dry-run` | 載入設定與資料集，顯示評測計畫但不呼叫 API |
 | `--resume TIMESTAMP` | 從指定時間戳的中斷點繼續評測 |
 | `--export FORMAT [FORMAT ...]` | 輸出格式（json, csv, html, excel, google_sheets） |

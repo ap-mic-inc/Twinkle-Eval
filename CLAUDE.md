@@ -641,7 +641,7 @@ results/
 
 ### 版本同步規則
 
-每次修改 `pyproject.toml` 的 `version` 欄位，**必須同步修改 `twinkle_eval/__init__.py` 的 `__version__`**（目前兩者不一致，待修正）。
+每次修改 `pyproject.toml` 的 `version` 欄位，**必須同步修改 `twinkle_eval/__init__.py` 的 `__version__`**。
 
 ### Release 與 Tag 規範
 
@@ -797,21 +797,22 @@ twinkle-eval --init all              # 產生全部範本到 configs/
 
 ## 14. 專案現況快照
 
-> 本節為時間點快照（最後更新：2026-07，v2.8.x）。版本歷史與最新變更以
+> 本節為時間點快照（最後更新：2026-10，v2.10.x）。版本歷史與最新變更以
 > `CHANGELOG.md` 為準；開放中的 Issue/PR 以 GitHub 為準。
 
 ### 基本資訊
 
 - **Repo**: https://github.com/ai-twinkle/Eval
 - **套件名稱**: `twinkle-eval`（PyPI）
-- **版本**: `2.8.0`（`pyproject.toml` 與 `__init__.py` 必須同步）
+- **版本**: `2.10.0`（`pyproject.toml` 與 `__init__.py` 必須同步）
 - **授權**: MIT
 - **Python**: ≥3.11
 
 ### 支援的評測方法（metrics/PRESETS）
 
 `pattern`、`box`、`logit`、`math`、`custom_regex`、`bfcl_fc`、`bfcl_prompt`、
-`ifeval`、`ifbench`、`niah`、`ragas`、`text2sql`、`regex_match`、`asr`、`vision_mcq`
+`ifeval`、`ifbench`、`niah`、`ragas`、`text2sql`、`regex_match`、`asr`、`vision_mcq`、
+`vistw_dialogue`、`vistw_judge`
 
 ### LLM 後端（llm_api.type）
 

@@ -87,6 +87,15 @@ class ConfigValidator:
             if not isinstance(llm_config["timeout"], (int, float)) or llm_config["timeout"] <= 0:
                 raise ValidationError("LLM API 'timeout' must be a positive number")
 
+        if llm_config.get("max_workers") is not None:
+            max_workers = llm_config["max_workers"]
+            if (
+                isinstance(max_workers, bool)
+                or not isinstance(max_workers, int)
+                or max_workers <= 0
+            ):
+                raise ValidationError("LLM API 'max_workers' must be a positive integer or null")
+
         if "api_rate_limit" in llm_config:
             if not isinstance(llm_config["api_rate_limit"], (int, float)):
                 raise ValidationError("LLM API 'api_rate_limit' must be a number")
@@ -110,6 +119,10 @@ class ConfigValidator:
             "max_tokens",
         ]
         for field in numeric_fields:
+            # temperature / top_p 可設為 null：不送出該參數、交由伺服器決定
+            # （部分推理模型，如 OpenAI o 系列，不接受 temperature）
+            if field in ("temperature", "top_p") and model_config.get(field, 0) is None:
+                continue
             if field in model_config:
                 if not isinstance(model_config[field], (int, float)):
                     raise ValidationError(f"Model field '{field}' must be a number")

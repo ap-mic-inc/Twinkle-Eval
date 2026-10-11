@@ -15,24 +15,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > 先前每題都回報 unparsed、整檔以 0% 正確率計入結果；現在視為 API 失敗，整檔拋出
 > `EvaluationError` 並排除在 `repeat_runs` 平均之外。
 >
-> ⚠️ **JSON / JSONL 資料集的 answer 正規化改變，分數可能變動。** 先前 JSON / JSONL 的 answer
-> 完全不正規化、Parquet / CSV 則一律轉大寫，同一份資料換格式就會得到不同分數。現在所有格式
-> 一致：只有當 answer 是 1–2 個字母、且對應到該題實際存在的選項鍵時才去空白並轉大寫。
+> ⚠️ **Parquet / CSV 資料集的自由作答題分數可能變動。** answer 正規化改為所有檔案格式一致：
+> 只有當 answer 是 1–2 個字母、且對應到該題實際存在的選項鍵時才去空白並轉大寫。先前
+> Parquet / CSV 會把所有 answer 轉大寫並去空白，破壞了數學（`\frac` → `\FRAC`）、SQL、
+> 逐字稿等 gold answer；JSON / JSONL 則完全不正規化。選擇題分數不受影響（scorer 本身會正規化）。
 >
 > ⚠️ **結果檔名的時間戳改為秒級**：`results_{timestamp}.json` 與
 > `eval_results_{timestamp}_run{N}.jsonl` 的 `{timestamp}` 由 `%Y%m%d_%H%M` 改為
-> `%Y%m%d_%H%M%S`，`--resume` 需傳入新格式的時間戳。依檔名格式解析結果的下游工具需調整。
+> `%Y%m%d_%H%M%S`。依檔名格式解析結果的下游工具需調整；舊格式的結果仍可用 `--resume` 續跑。
 
 ### Added
 - **OpenAI Responses API 後端**（`llm_api.type: "openai_responses"`）：呼叫 `/v1/responses`，
   於 `call()` 內轉換為 ChatCompletion 格式，所有評測路徑不需修改。支援多模態輸入、
   reasoning summary（對應 `message.reasoning`）、tool calls；`num_samples > 1` 以多次請求合併；
-  `max_tokens` 對應 `max_output_tokens`，frequency / presence penalty 不支援而忽略
+  `max_tokens` 對應 `max_output_tokens`，frequency / presence penalty 不支援而忽略；
+  `finish_reason` 依回應狀態對應（截斷為 `length`、tool calls 為 `tool_calls`）。
+  reasoning summary 需在 `extra_body` 設定 `reasoning.summary` 才會回傳
 - **`--convert-to-excel JSONL_FILE`**：將逐題結果 JSONL 轉為 `.xlsx`，常用欄位在前、
-  各 benchmark 的額外欄位依出現順序附加；處理 Excel 儲存格長度上限與非法控制字元。
+  各 benchmark 的額外欄位依出現順序附加；處理 Excel 儲存格長度上限與非法控制字元，
+  `=` 開頭的內容一律以純文字寫入（避免模型輸出在開檔時被當成公式執行）。
   需安裝新的可選依賴群組 `twinkle-eval[excel]`（openpyxl）
-- `llm_api.max_workers`（可選，預設 `null`）：控制並行請求的執行緒數，各範本已加入此欄位；
-  `llm_api.type` 也加入各範本以標示可選的後端
+- `llm_api.max_workers`（可選，預設 `null`；必須是正整數或 `null`，由 `--validate` 檢查）：
+  控制並行請求的執行緒數，各範本已加入此欄位；`llm_api.type` 也加入各範本以標示可選的後端
+- `model.temperature` / `model.top_p` 可設為 `null`：不送出該參數、交由伺服器決定
+  （OpenAI o 系列等推理模型不接受 temperature）。Responses API 的 reasoning 設定
+  （如 `reasoning: {effort: ..., summary: "auto"}`）透過 `model.extra_body` 傳入
+- 分散式腳本（`scripts/run_slurm_*.sh`）匯出的 `TWINKLE_EVAL_RUN_TIMESTAMP` 現在會被 runner
+  採用，各節點寫入同一組檔名，之後即可用該時間戳執行 `--finalize-results`
 - 多資料集評測時，每完成一個資料集就印出累計成績
 
 ### Changed
@@ -42,8 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   在沒有 API 失敗、沒有 `--resume` 的情況下，七條路徑送出的 prompt、JSONL 內容與 metrics
   與先前相同（JSONL 多了 `file` 欄位）
 - JSONL 每列新增 `file` 欄位（來源資料集檔案路徑），作為 `--resume` 比對已完成題目的依據
-- **`--validate` 會對 API 端點試打一次**（`max_tokens=16`）：結構驗證通過後，及早回報連線 /
-  API 金鑰 / 模型名稱錯誤並以 exit code 1 結束。whisper 後端略過；`--dry-run` 仍不連網
+- **`--validate` 會對 API 端點試打一次**：結構驗證通過後，及早回報連線 / API 金鑰 / 模型名稱
+  錯誤並以 exit code 1 結束。試打使用 30 秒 timeout 且不重試；`logit` 方法改以 completions
+  logprobs 試打，音檔評測略過；`--dry-run` 仍不連網
 - pandas / pyarrow / HF `datasets` 改為在函式內延遲載入，純 JSONL 評測不再負擔其啟動時間
 - HTML 報表的逐題渲染去重複，改以 list 組裝字串
 - 套件全面以 black / isort 格式化（不改變行為）
@@ -66,11 +76,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`--download-dataset` 在指定的 split 不存在時改為下載所有 split**：先前假設一定有 `test`
   split，split 名稱自訂的資料集會完全下載失敗；多個 split 也不再互相覆蓋同名 parquet 檔
-- 還原清理死碼時誤刪的 CLI 說明文字
+- 開啟 Google Drive 上傳時，本次評測的 log 檔一定會被上傳：先前以 runner 的時間戳比對 log
+  檔名，而 log 檔的時間戳在 import 時決定，兩者不在同一秒（秒級時間戳下）就會漏傳
 
 ### Removed
 - `twinkle_eval.core.Registry`：匯出但從未被使用（各工廠有自己的註冊表）
-- `cli.py` 中從未被呼叫的 `print_version` / `print_help` / `cli_list_*`
 - `core/validators.py` 的 `validate_dataset_content` 與 `RuntimeValidator`：沒有任何呼叫端，
   且前者硬編碼 A/B/C/D 選項標籤（違反原則 C）
 
