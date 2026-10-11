@@ -1,3 +1,4 @@
+import functools
 import inspect
 import json
 import os
@@ -5,17 +6,18 @@ import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import comb
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from tqdm import tqdm
 
 from twinkle_eval.core.abc import Extractor, Scorer
+from twinkle_eval.core.exceptions import EvaluationError
 from twinkle_eval.core.logger import log_error, log_warning
+from twinkle_eval.core.prompts import resolve_system_prompt
 from twinkle_eval.datasets import Dataset, index_to_label
 from twinkle_eval.metrics.extractors.bfcl_prompt import inject_bfcl_system_prompt
 from twinkle_eval.metrics.extractors.tool_call import convert_bfcl_functions_to_tools
 from twinkle_eval.models import LLM
-from twinkle_eval.core.prompts import resolve_system_prompt
 
 
 def _get_node_id() -> str:
@@ -49,6 +51,33 @@ def _get_reasoning_text(message: Any) -> Optional[str]:
     if reasoning is None:
         reasoning = getattr(message, "reasoning_content", None)
     return reasoning
+
+
+def _tool_calls_to_extraction_source(raw_tool_calls: List[Dict[str, Any]]) -> Optional[str]:
+    """將原始 tool calls 轉為 ToolCallExtractor 的輸入（JSON 字串）。
+
+    任一呼叫的 arguments 無法解析為 JSON 物件時回傳 None（該 sample 計為無法解析），
+    而不是讓例外中止整個檔案的評測、連帶遺失已完成的題目。合法 JSON 但不是物件
+    （如 ``"5"``、``"null"``）同樣視為無法解析，否則會在 scorer 比對參數時出錯。
+    arguments 缺少、為空字串或只有空白時視為沒有參數。
+    """
+    calls = []
+    for call in raw_tool_calls:
+        arguments = call["arguments"]
+        if isinstance(arguments, str):
+            if not arguments.strip():
+                arguments = {}
+            else:
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    return None
+        elif arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return None
+        calls.append({"name": call["name"], "arguments": arguments})
+    return json.dumps(calls, ensure_ascii=False)
 
 
 def detect_option_keys(question_data: Dict[str, Any]) -> List[str]:
@@ -289,6 +318,13 @@ class _EvalAccumulator:
         self.total_failed = 0
         self.question_stats: Dict[Any, Dict[str, int]] = {}
         self.detailed_results: List[Dict[str, Any]] = []
+        # IFEval / IFBench 的附加指標
+        self.ifeval_prompt_loose = 0
+        self.ifeval_inst_strict: List[bool] = []
+        self.ifeval_inst_loose: List[bool] = []
+        # ASR 的附加指標
+        self.asr_wer: List[float] = []
+        self.asr_cer: List[float] = []
 
     def record(
         self,
@@ -312,6 +348,39 @@ class _EvalAccumulator:
         self.total_samples += 1
         if detail is not None:
             self.detailed_results.append(detail)
+
+    def record_failure(self, question_id: Any, num_samples: int) -> None:
+        """記錄一題 API 呼叫失敗（重試耗盡）。
+
+        失敗的 sample 計入分母並視為答錯：若不計入，「10 題 5 題逾時、其餘全對」
+        會被報成 100%。失敗題不寫入 JSONL，因此 --resume 時會被重新評測。
+        """
+        self.question_stats.setdefault(question_id, {"correct": 0, "total": 0})
+        self.question_stats[question_id]["total"] += num_samples
+        self.total_samples += num_samples
+        self.total_failed += num_samples
+
+    def backfill(self, question_id: Any, row: Dict[str, Any]) -> None:
+        """--resume：把先前已完成的一個 sample 回填進統計（不重寫 JSONL）。
+
+        row 為 JSONL 結果列中與統計相關的欄位（見 main._resume_backfill_fields）。
+        """
+        self.record(
+            question_id,
+            bool(row.get("is_correct", False)),
+            unparsed=bool(row.get("unparsed", False)),
+            detail=None,
+        )
+        if row.get("prompt_loose"):
+            self.ifeval_prompt_loose += 1
+        if isinstance(row.get("instruction_strict"), list):
+            self.ifeval_inst_strict.extend(row["instruction_strict"])
+        if isinstance(row.get("instruction_loose"), list):
+            self.ifeval_inst_loose.extend(row["instruction_loose"])
+        if row.get("wer") is not None:
+            self.asr_wer.append(row["wer"])
+        if row.get("cer") is not None:
+            self.asr_cer.append(row["cer"])
 
 
 class Evaluator:
@@ -351,17 +420,19 @@ class Evaluator:
         self.pass_k = max(1, int(pass_k))
         self.shuffle_options = bool(shuffle_options)
         self.model_overrides = model_overrides or {}
-        # max_workers 未設定（null / 0 / 負值）時交由 ThreadPoolExecutor 使用預設值
-        max_workers = self.config["llm_api"].get("max_workers")
-        self._max_workers: Optional[int] = (
-            int(max_workers) if max_workers and int(max_workers) > 0 else None
-        )
-        # scorer.score_full 的簽名在整次評測中不變，於此一次解析避免逐題呼叫 inspect
-        self._score_full_accepts_prompt = hasattr(scorer, "score_full") and (
-            "prompt" in inspect.signature(scorer.score_full).parameters
-        )
+        # max_workers 已由 ConfigValidator 檢查（正整數或 null）；null 時使用 ThreadPoolExecutor 預設值
+        self._max_workers: Optional[int] = self.config["llm_api"].get("max_workers") or None
 
     # ── 共用輔助 ────────────────────────────────────────────────────────────
+
+    @functools.cached_property
+    def _score_full_accepts_prompt(self) -> bool:
+        """scorer.score_full 是否接受 prompt 參數。
+
+        只有 IFEval 路徑會用到，因此延遲到第一次使用時才解析並快取，
+        避免其他評測路徑在建構期就對 scorer 做 introspection。
+        """
+        return "prompt" in inspect.signature(self.scorer.score_full).parameters
 
     def shuffle_question_options(self, question_data: dict) -> dict:
         """隨機重排題目選項，消除模型對選項位置的偏好。
@@ -408,12 +479,17 @@ class Evaluator:
         self,
         dataset: Dataset,
         completed_ids: Optional[Any],
+        shuffle: bool = False,
     ) -> Iterator[Tuple[int, dict]]:
-        """迭代題目，套用 shuffle 與 --resume 已完成題目跳過。"""
+        """迭代題目，跳過 --resume 已完成的題目。
+
+        shuffle=True 時套用 ``shuffle_options``；只有選擇題路徑（logprobs / vision /
+        text）會開啟，其餘路徑的題目沒有選項可重排。
+        """
         for idx, q in enumerate(tqdm(dataset, desc="處理題庫中")):
             if completed_ids is not None and str(idx) in completed_ids:
                 continue
-            if self.shuffle_options:
+            if shuffle and self.shuffle_options:
                 q = self.shuffle_question_options(q)
             yield idx, q
 
@@ -422,18 +498,29 @@ class Evaluator:
         future_tasks: list,
         future_to_data: Dict[Any, Any],
         acc: _EvalAccumulator,
+        samples_per_call: Optional[int] = None,
+        on_failure: Optional[Callable[[Any], None]] = None,
     ) -> Iterator[Tuple[Any, Any, Any]]:
         """迭代已完成的 futures，統一處理單題 API 失敗。
 
-        單題在重試耗盡後仍失敗時跳過該題並計入 failed，
-        避免整檔已完成的結果一併遺失。
+        單題在重試耗盡後仍失敗時，該題的 sample 以答錯計入（見
+        ``_EvalAccumulator.record_failure``），而不是讓整檔已完成的結果一併遺失。
+
+        Args:
+            samples_per_call: 每個請求涵蓋的 sample 數，None 表示 ``samples_per_question``。
+            on_failure:       失敗時以該題的 future_to_data 資料呼叫，供有附加指標的路徑
+                              （IFEval、ASR）把失敗題一併計入那些指標的分母。
         """
+        num_samples = self.samples_per_question if samples_per_call is None else samples_per_call
         for future in tqdm(as_completed(future_tasks), total=len(future_tasks), desc="處理回應中"):
             try:
                 completion = future.result()
             except Exception as e:
-                log_error(f"問題 {future_to_data[future][2] + 1} API 呼叫失敗，跳過該題: {e}")
-                acc.total_failed += 1
+                question_id = future_to_data[future][2]
+                log_error(f"問題 {question_id + 1} API 呼叫失敗，計為答錯: {e}")
+                acc.record_failure(question_id, num_samples)
+                if on_failure is not None:
+                    on_failure(future_to_data[future])
                 continue
             yield completion, completion.usage, future_to_data[future]
 
@@ -472,7 +559,7 @@ class Evaluator:
         file_path: str,
         timestamp: str,
         prompt_lang: str = "zh",
-        completed_ids: Optional[Any] = None,
+        completed_ids: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> Tuple[str, Dict[str, Any], str]:
         """評測單一檔案。
 
@@ -480,10 +567,12 @@ class Evaluator:
             file_path: 評測檔案路徑
             timestamp: 結果檔時間戳記（含 run 編號）
             prompt_lang: system prompt 語言
-            completed_ids: --resume 模式下此檔案已完成的題目。
-                           dict（question_id 字串 → is_correct）時會跳過這些題目
-                           並將其結果回填進統計，讓 summary 涵蓋整個資料集；
-                           set（僅 question_id 字串）時只跳過、不回填。
+            completed_ids: --resume 模式下此檔案已完成的題目（question_id 字串 → 各 sample
+                           的結果紀錄 list）。這些題目會被跳過，其結果回填進統計，
+                           讓 summary 涵蓋整個資料集。
+
+        Raises:
+            EvaluationError: 所有題目的 API 呼叫都失敗（沒有任何可計分的結果）。
         """
         dataset = Dataset(file_path)
         # 每個檔案提示一次：哪些非選項欄位不會進入 prompt。
@@ -512,23 +601,29 @@ class Evaluator:
 
         # --resume：回填先前已完成題目的結果（不重寫 JSONL），
         # 避免 resume 後的 accuracy 只以補跑的題目計算
-        if isinstance(completed_ids, dict):
-            for qid_str, was_correct in completed_ids.items():
+        if completed_ids:
+            for qid_str, rows in completed_ids.items():
                 seed_qid: Any = int(qid_str) if str(qid_str).isdigit() else qid_str
-                acc.record(seed_qid, bool(was_correct), unparsed=False, detail=None)
+                for row in rows:
+                    acc.backfill(seed_qid, row)
 
         with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
             pipeline = self._select_pipeline()
             pipeline(dataset, executor, acc, prompt_lang, completed_ids, file_path)
 
+        # 全部失敗時不得回報 accuracy=0：那會讓「API 端點掛掉的一次 run」被當成 0% 正確率
+        # 計入 repeat_runs 平均。拋出例外讓上層把這次 run 排除在外。
+        if acc.total_failed > 0 and acc.total_failed == acc.total_samples:
+            raise EvaluationError(
+                f"{file_path} 的 {acc.total_failed} 個樣本 API 呼叫全部失敗，"
+                "沒有可計分的結果。請確認 API 端點是否正常運作。"
+            )
+
         accuracy = acc.total_correct / acc.total_samples if acc.total_samples else 0
 
         # 計算 pass@k
         pass_at_k_values = []
-        for key, stats in acc.question_stats.items():
-            # 跳過內部統計 key（IFEval / ASR）
-            if isinstance(key, str) and key.startswith("_"):
-                continue
+        for stats in acc.question_stats.values():
             c = stats["correct"]
             n = stats["total"]
             k = self.pass_k
@@ -542,8 +637,7 @@ class Evaluator:
         os.makedirs(results_dir, exist_ok=True)
 
         node_id = _get_node_id()
-        # rank 來自 config 的 distributed 區段（由 ConfigurationManager 從 RANK 環境變數帶入）
-        rank = self.config.get("distributed", {}).get("rank", 0)
+        rank = self.model_overrides.get("_rank", 0)
         if node_id != "0" or rank != 0:
             shard_suffix = f"_node{node_id}_rank{rank}"
         else:
@@ -562,8 +656,11 @@ class Evaluator:
         if acc.total_unparsed > 0:
             print(f"⚠️  無法解析: {acc.total_unparsed}/{acc.total_samples} ({unparsed_rate:.1%})")
         if acc.total_failed > 0:
-            # API 呼叫失敗被跳過的題目不計入 accuracy 分母，必須明確警告使用者
-            print(f"⚠️  API 呼叫失敗被跳過: {acc.total_failed} 題（accuracy 僅以成功題目計算）")
+            # 失敗的 sample 以答錯計入 accuracy，必須明確提示使用者分數受到影響
+            print(
+                f"⚠️  API 呼叫失敗: {acc.total_failed}/{acc.total_samples} 個樣本，已計為答錯"
+                "（--resume 會重新評測這些題目）"
+            )
         metrics: Dict[str, Any] = {
             "accuracy": accuracy,
             "pass_at_k": pass_at_k,
@@ -577,10 +674,8 @@ class Evaluator:
 
         # ASR 額外指標
         if getattr(self.extractor, "uses_audio", False):
-            asr_wer = acc.question_stats.get("_asr_wer", {})
-            asr_cer = acc.question_stats.get("_asr_cer", {})
-            avg_wer = asr_wer["sum"] / asr_wer["count"] if asr_wer.get("count") else None
-            avg_cer = asr_cer["sum"] / asr_cer["count"] if asr_cer.get("count") else None
+            avg_wer = sum(acc.asr_wer) / len(acc.asr_wer) if acc.asr_wer else None
+            avg_cer = sum(acc.asr_cer) / len(acc.asr_cer) if acc.asr_cer else None
             if avg_wer is not None:
                 metrics["avg_wer"] = round(avg_wer, 6)
             if avg_cer is not None:
@@ -595,18 +690,15 @@ class Evaluator:
 
         # IFEval 額外指標
         if getattr(self.extractor, "uses_ifeval", False):
-            inst_strict = acc.question_stats.get("_ifeval_inst_strict", {})
-            inst_loose = acc.question_stats.get("_ifeval_inst_loose", {})
-            prompt_loose_count = sum(
-                1 for d in acc.detailed_results if d.get("prompt_loose", False)
+            # 從 accumulator 讀取，而非只數本次寫出的 detailed_results，
+            # 這樣 --resume 回填的題目也會計入（分母 total_samples 本來就含回填題）
+            inst_strict = acc.ifeval_inst_strict
+            inst_loose = acc.ifeval_inst_loose
+            inst_strict_acc = sum(inst_strict) / len(inst_strict) if inst_strict else 0.0
+            inst_loose_acc = sum(inst_loose) / len(inst_loose) if inst_loose else 0.0
+            prompt_loose_acc = (
+                acc.ifeval_prompt_loose / acc.total_samples if acc.total_samples else 0.0
             )
-            inst_strict_acc = (
-                inst_strict["correct"] / inst_strict["total"] if inst_strict.get("total") else 0.0
-            )
-            inst_loose_acc = (
-                inst_loose["correct"] / inst_loose["total"] if inst_loose.get("total") else 0.0
-            )
-            prompt_loose_acc = prompt_loose_count / acc.total_samples if acc.total_samples else 0.0
             metrics.update(
                 {
                     "prompt_strict": accuracy,  # same as accuracy
@@ -636,7 +728,7 @@ class Evaluator:
         """logit 路徑：以各選項的 log-likelihood 決定答案。"""
         question_records = []
 
-        for idx, q in self._iter_questions(dataset, completed_ids):
+        for idx, q in self._iter_questions(dataset, completed_ids, shuffle=True):
             option_keys = detect_option_keys(q)
             question_text = build_question_text(q, option_keys)
             logit_context = question_text + "\nAnswer:"
@@ -670,20 +762,41 @@ class Evaluator:
             question_text = record["question_text"]
             correct_answer = record["correct_answer"]
 
+            # 任一選項失敗即整題視為失敗：只在倖存的選項中挑最大值，
+            # 等於把一次暫時性錯誤變成一個被計分的作答。
+            # LLM.score_continuation() 的契約是出錯時回傳 -inf 而非拋例外
+            # （API 錯誤、端點不支援 echo / logprobs 都是），所以 -inf 與例外同樣視為失敗；
+            # 整檔都失敗時由 evaluate_file 拋出 EvaluationError。
             scores: Dict[str, float] = {}
+            failed_choices: List[str] = []
             for k, f in record["choice_futures"].items():
                 try:
-                    scores[k] = f.result()
+                    score = f.result()
+                except NotImplementedError:
+                    # LLM 後端不支援 logit 評測是設定錯誤，不是 API 失敗，直接讓它浮出
+                    raise
                 except Exception as e:
                     log_error(f"問題 {question_id + 1} 選項 {k} API 呼叫失敗: {e}")
-                    scores[k] = float("-inf")
+                    failed_choices.append(k)
+                    continue
+                if score == float("-inf"):
+                    failed_choices.append(k)
+                else:
+                    scores[k] = score
+            if failed_choices:
+                log_error(
+                    f"問題 {question_id + 1} 選項 {', '.join(failed_choices)} "
+                    "無法取得 log-likelihood，計為答錯"
+                )
+                acc.record_failure(question_id, 1)
+                continue
 
-            if scores and any(v > float("-inf") for v in scores.values()):
-                predicted_raw = max(scores, key=scores.get)
+            if scores:
+                predicted_raw = max(scores, key=scores.__getitem__)
                 predicted_answer: Optional[str] = self.scorer.normalize(predicted_raw)
             else:
                 predicted_answer = None
-                log_error(f"問題 {question_id + 1} 的所有選項均無法取得 log-likelihood")
+                log_error(f"問題 {question_id + 1} 偵測不到選項，無法以 log-likelihood 作答")
 
             is_correct = (
                 False
@@ -705,10 +818,7 @@ class Evaluator:
                     "llm_reasoning_output": None,
                     "predicted_answer": predicted_answer,
                     "is_correct": is_correct,
-                    # -inf 無法表示為合法 JSON（會輸出 -Infinity），改以 null 表示失敗選項
-                    "logprob_scores": {
-                        k: (None if v == float("-inf") else v) for k, v in scores.items()
-                    },
+                    "logprob_scores": scores,
                     **self._usage_fields(None),
                 },
             )
@@ -757,18 +867,21 @@ class Evaluator:
             for sample_id, choice in enumerate(completion.choices[: self.samples_per_question]):
                 message = choice.message
                 tool_calls = getattr(message, "tool_calls", None)
+                raw_tool_calls = [
+                    {
+                        "name": getattr(tc.function, "name", None) or "",
+                        "arguments": getattr(tc.function, "arguments", None),
+                    }
+                    for tc in tool_calls or []
+                ]
 
                 if tool_calls:
-                    extraction_source = json.dumps(
-                        [
-                            {
-                                "name": tc.function.name,
-                                "arguments": json.loads(tc.function.arguments),
-                            }
-                            for tc in tool_calls
-                        ],
-                        ensure_ascii=False,
-                    )
+                    extraction_source = _tool_calls_to_extraction_source(raw_tool_calls)
+                    if extraction_source is None:
+                        log_error(
+                            f"問題 {question_id} 的 tool call 參數不是合法 JSON，計為無法解析: "
+                            f"{raw_tool_calls}"
+                        )
                 else:
                     extraction_source = None
                     log_error(
@@ -789,12 +902,12 @@ class Evaluator:
                         "sample_id": sample_id,
                         "question": question_text,
                         "correct_answer": correct_answer,
-                        "llm_output": json.dumps(
-                            [tc.function.name for tc in tool_calls] if tool_calls else [],
-                        ),
-                        "llm_reasoning_output": None,
+                        "llm_output": json.dumps([call["name"] for call in raw_tool_calls]),
+                        "llm_reasoning_output": _get_reasoning_text(message),
                         "predicted_answer": predicted_answer,
                         "is_correct": is_correct,
+                        # 模型回傳的原始 tool calls（arguments 為未解析的字串），供除錯參數格式錯誤
+                        "tool_calls": raw_tool_calls,
                         **self._usage_fields(usage),
                     },
                 )
@@ -925,11 +1038,19 @@ class Evaluator:
                 kwargs_list,
             )
 
-        # 累積 instruction-level 統計（跨題目）
-        all_inst_strict: list = []
-        all_inst_loose: list = []
+        def count_failed_instructions(data: Any) -> None:
+            # 失敗題的每條 instruction 都計為未遵循，instruction-level 指標才不會被灌水
+            failed = [False] * len(data[3])
+            acc.ifeval_inst_strict.extend(failed)
+            acc.ifeval_inst_loose.extend(failed)
 
-        for completion, usage, data in self._iter_completions(future_tasks, future_to_data, acc):
+        for completion, usage, data in self._iter_completions(
+            future_tasks,
+            future_to_data,
+            acc,
+            samples_per_call=1,
+            on_failure=count_failed_instructions,
+        ):
             question_text, ground_truth, question_id, inst_ids, kwargs_list = data
 
             message = completion.choices[0].message
@@ -961,8 +1082,10 @@ class Evaluator:
             inst_strict = ifeval_result["instruction_strict"]
             inst_loose = ifeval_result["instruction_loose"]
 
-            all_inst_strict.extend(inst_strict)
-            all_inst_loose.extend(inst_loose)
+            acc.ifeval_inst_strict.extend(inst_strict)
+            acc.ifeval_inst_loose.extend(inst_loose)
+            if prompt_loose:
+                acc.ifeval_prompt_loose += 1
 
             # is_correct = prompt-level strict（主要指標）
             is_correct = prompt_strict
@@ -988,18 +1111,6 @@ class Evaluator:
                     **self._usage_fields(usage),
                 },
             )
-
-        # 在 metrics 中補充 instruction-level 指標
-        if all_inst_strict:
-            acc.question_stats["_ifeval_inst_strict"] = {
-                "correct": sum(all_inst_strict),
-                "total": len(all_inst_strict),
-            }
-        if all_inst_loose:
-            acc.question_stats["_ifeval_inst_loose"] = {
-                "correct": sum(all_inst_loose),
-                "total": len(all_inst_loose),
-            }
 
     def _run_audio_pipeline(
         self,
@@ -1074,12 +1185,20 @@ class Evaluator:
             future_tasks.append(future)
             future_to_data[future] = (audio_path, correct_answer, idx)
 
-        # 累積 ASR 指標
-        all_wer: list = []
-        all_cer: list = []
         jiwer_warned = False
 
-        for completion, usage, data in self._iter_completions(future_tasks, future_to_data, acc):
+        def count_failed_transcription(data: Any) -> None:
+            # 失敗題視為空轉錄：WER / CER 皆為 1.0（全部刪除），避免平均值只算成功的題目
+            acc.asr_wer.append(1.0)
+            acc.asr_cer.append(1.0)
+
+        for completion, usage, data in self._iter_completions(
+            future_tasks,
+            future_to_data,
+            acc,
+            samples_per_call=1,
+            on_failure=count_failed_transcription,
+        ):
             audio_path, correct_answer, question_id = data
 
             message = completion.choices[0].message
@@ -1096,8 +1215,8 @@ class Evaluator:
             if hasattr(self.scorer, "score_full") and predicted_answer is not None:
                 try:
                     asr_detail = self.scorer.score_full(predicted_raw, correct_answer)
-                    all_wer.append(asr_detail.get("wer", 0.0))
-                    all_cer.append(asr_detail.get("cer", 0.0))
+                    acc.asr_wer.append(asr_detail.get("wer", 0.0))
+                    acc.asr_cer.append(asr_detail.get("cer", 0.0))
                 except ImportError as e:
                     # jiwer 未安裝時跳過 WER/CER 計算，僅記錄一次原因避免洗版
                     if not jiwer_warned:
@@ -1130,18 +1249,6 @@ class Evaluator:
                 detail=result_entry,
             )
 
-        # 在 metrics 中補充 ASR 指標
-        if all_wer:
-            acc.question_stats["_asr_wer"] = {
-                "sum": sum(all_wer),
-                "count": len(all_wer),
-            }
-        if all_cer:
-            acc.question_stats["_asr_cer"] = {
-                "sum": sum(all_cer),
-                "count": len(all_cer),
-            }
-
     def _run_vision_pipeline(
         self,
         dataset: Dataset,
@@ -1161,7 +1268,7 @@ class Evaluator:
         future_tasks: list = []
         future_to_data: Dict[Any, Any] = {}
 
-        for idx, q in self._iter_questions(dataset, completed_ids):
+        for idx, q in self._iter_questions(dataset, completed_ids, shuffle=True):
             option_keys = detect_option_keys(q)
 
             image_path = q.get(image_field) or q.get("image_url") or q.get("image")
@@ -1264,7 +1371,7 @@ class Evaluator:
         future_tasks: list = []
         future_to_data: Dict[Any, Any] = {}
 
-        for idx, q in self._iter_questions(dataset, completed_ids):
+        for idx, q in self._iter_questions(dataset, completed_ids, shuffle=True):
             option_keys = detect_option_keys(q)
             question_text = build_question_text(q, option_keys)
 

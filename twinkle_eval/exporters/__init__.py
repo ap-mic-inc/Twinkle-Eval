@@ -131,7 +131,7 @@ class ExcelExporter(ResultsExporter):
             import openpyxl  # noqa: F401 — 提前檢查，給出安裝指引而非晦澀的 ImportError
         except ImportError as e:
             raise ImportError(
-                "Excel 匯出需要 openpyxl，請執行: pip install twinkle-eval[excel]"
+                "Excel 匯出需要 openpyxl，請執行: pip install 'twinkle-eval[excel]'"
             ) from e
 
         if not output_path.endswith(self.get_file_extension()):

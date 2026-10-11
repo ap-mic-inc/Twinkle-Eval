@@ -2,11 +2,20 @@ import argparse
 import copy
 import os
 import time
+from typing import Any
 
+from .core import logger as logger_module
 from .core.config import load_config
 from .core.logger import log_error
 from .datasets import find_all_evaluation_files
 from .exporters import ResultsExporterFactory
+
+# TwinkleEvalRunner 的實作位於 runners/standard.py（CLAUDE.md §4：main.py 只負責
+# 組裝流程與 CLI 參數）。此處重新匯出以維持 `from twinkle_eval.main import
+# TwinkleEvalRunner` 的向下相容（CLAUDE.md §2 原則 F）。
+from .runners.standard import TwinkleEvalRunner
+
+__all__ = ["TwinkleEvalRunner", "create_cli_parser", "main"]
 
 
 def convert_json_to_html(json_file_path: str) -> int:
@@ -70,7 +79,7 @@ def convert_jsonl_to_excel(jsonl_path: str) -> int:
             import pandas as pd
             from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
         except ImportError:
-            print("❌ 缺少 Excel 轉換所需套件，請執行: pip install twinkle-eval[excel]")
+            print("❌ 缺少 Excel 轉換所需套件，請執行: pip install 'twinkle-eval[excel]'")
             return 1
 
         rows: list[dict] = []
@@ -127,7 +136,14 @@ def convert_jsonl_to_excel(jsonl_path: str) -> int:
 
         df = pd.DataFrame(rows, columns=columns)
         output_path = os.path.splitext(jsonl_path)[0] + ".xlsx"
-        df.to_excel(output_path, index=False, engine="openpyxl")
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False)
+            # openpyxl 會把 "=" 開頭的字串寫成公式；模型輸出與題目都是不受信任的內容，
+            # 一律以純文字寫入，避免開檔時被當成公式執行（formula injection）
+            for row in writer.sheets["Sheet1"].iter_rows():
+                for cell in row:
+                    if cell.data_type == "f":
+                        cell.data_type = "s"
 
         print(f"✅ 成功轉換為 Excel: {output_path}（{len(df)} 列）")
         if truncated:
@@ -257,13 +273,6 @@ def create_default_config(template_name: str | None = None, output_dir: str = "c
         return 1
 
 
-# TwinkleEvalRunner 的唯一實作位於 runners/standard.py；
-# 此處 re-export 以維持 `from twinkle_eval.main import TwinkleEvalRunner` 的相容性
-from .runners.standard import TwinkleEvalRunner  # noqa: E402
-
-__all__ = ["TwinkleEvalRunner", "create_cli_parser", "main"]
-
-
 def create_cli_parser() -> argparse.ArgumentParser:
     """建立命令列介面解析器
 
@@ -293,10 +302,10 @@ def create_cli_parser() -> argparse.ArgumentParser:
   twinkle-eval --dry-run               # 預覽評測計畫（不呼叫 API）
 
 接續中斷的評測:
-  twinkle-eval --resume 20250401_1200  # 從指定時間戳記的中斷點繼續
+  twinkle-eval --resume 20250401_120000  # 從指定時間戳記的中斷點繼續
 
 結果格式轉換:
-  twinkle-eval --convert-to-html results_20240101_1200.json  # 將 JSON 結果轉換為 HTML
+  twinkle-eval --convert-to-html results_20240101_120000.json  # 將 JSON 結果轉換為 HTML
   twinkle-eval --convert-to-excel eval_results_20240101_120000_run0.jsonl  # 將逐題 JSONL 轉換為 Excel
 
 效能基準測試:
@@ -541,8 +550,51 @@ def create_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ping_llm(live_config: dict[str, Any]) -> str | None:
+    """以最小請求試打 API 端點，回傳錯誤訊息；成功或略過時回傳 None。
+
+    試打方式依評測方法的 Extractor capability 決定：logit 方法走 completions 端點
+    （score_continuation），音檔路徑需要真實音檔而略過，其餘以一次 chat 請求試打。
+    試打使用較短的 timeout 且不重試，端點無回應時不會依評測設定卡住數十分鐘。
+    """
+    extractor = live_config.get("extractor_instance")
+    if getattr(extractor, "uses_audio", False):
+        print("⏭️  音檔評測需要真實音檔，略過 API 連線測試")
+        return None
+
+    llm_instance = live_config["llm_instance"]
+    original_client = getattr(llm_instance, "client", None)
+    if original_client is not None and hasattr(original_client, "with_options"):
+        llm_instance.client = original_client.with_options(timeout=30, max_retries=0)
+    try:
+        if getattr(extractor, "uses_logprobs", False):
+            score = llm_instance.score_continuation("ping", " A")
+            if score == float("-inf"):
+                # score_continuation 出錯時只記錄 log 並回傳 -inf，實際錯誤需到 log 檔查看
+                return (
+                    "無法從 completions 端點取得 logprobs（連線失敗，或端點不支援 echo + logprobs）"
+                    f"，詳細錯誤見 {logger_module.log_filename}"
+                )
+            print("✅ API 端點試打成功（completions logprobs）")
+            return None
+        # max_tokens 至少 16：Responses API 的 max_output_tokens 下限為 16
+        response = llm_instance.call(
+            "ping",
+            system_prompt_enabled=False,
+            model_overrides={"max_tokens": 16},
+        )
+        model_name = getattr(response, "model", "") or live_config["model"]["name"]
+        print(f"✅ API 端點試打成功（模型: {model_name}）")
+        return None
+    except Exception as e:
+        return str(e)
+    finally:
+        if original_client is not None:
+            llm_instance.client = original_client
+
+
 def _handle_validate(config_path: str) -> int:
-    """處理 --validate：僅驗證設定檔與資料集格式。
+    """處理 --validate：驗證設定檔與資料集格式，並對 API 端點試打一次。
 
     Args:
         config_path: 設定檔路徑
@@ -599,22 +651,12 @@ def _handle_validate(config_path: str) -> int:
     if not errors:
         try:
             live_config = load_config(config_path)
-            llm_type = live_config["llm_api"].get("type", "openai")
-            if llm_type == "whisper":
-                # whisper 後端的 call() 需要真實音檔，無法以文字試打
-                print("⏭️  whisper 後端不支援文字試打，略過 API 連線測試")
-            else:
-                llm_instance = live_config["llm_instance"]
-                # max_tokens 至少 16：Responses API 的 max_output_tokens 下限為 16
-                response = llm_instance.call(
-                    "ping",
-                    system_prompt_enabled=False,
-                    model_overrides={"max_tokens": 16},
-                )
-                model_name = getattr(response, "model", "") or live_config["model"]["name"]
-                print(f"✅ API 端點試打成功（模型: {model_name}）")
         except Exception as e:
-            errors.append(f"API 端點試打失敗：{e}")
+            errors.append(f"設定檔載入：{e}")
+        else:
+            ping_error = _ping_llm(live_config)
+            if ping_error:
+                errors.append(f"API 端點試打失敗：{ping_error}")
 
     # 5. 結果
     if errors:
@@ -689,6 +731,24 @@ def _handle_dry_run(config_path: str) -> int:
     return 0
 
 
+def _resume_backfill_fields(record: dict[str, Any]) -> dict[str, Any]:
+    """從 JSONL 結果列取出 --resume 回填統計所需的欄位，其餘（模型輸出等）捨棄以節省記憶體。"""
+    kept = {
+        k: record[k]
+        for k in (
+            "is_correct",
+            "prompt_loose",
+            "instruction_strict",
+            "instruction_loose",
+            "wer",
+            "cer",
+        )
+        if k in record
+    }
+    kept["unparsed"] = record.get("predicted_answer") is None
+    return kept
+
+
 def _handle_resume(config_path: str, timestamp: str, export_formats: list[str]) -> int:
     """處理 --resume：從指定時間戳記的中斷點繼續評測。
 
@@ -696,7 +756,7 @@ def _handle_resume(config_path: str, timestamp: str, export_formats: list[str]) 
 
     Args:
         config_path: 設定檔路徑
-        timestamp: 中斷時的時間戳記（如 20250401_1200）
+        timestamp: 中斷時的時間戳記（如 20250401_120000）
         export_formats: 輸出格式列表
 
     Returns:
@@ -714,8 +774,11 @@ def _handle_resume(config_path: str, timestamp: str, export_formats: list[str]) 
         print(f"   搜尋路徑：{pattern}")
         return 1
 
-    # 2. 解析已完成的題目（per run）：file|question_id -> is_correct
-    completed: dict[str, dict[str, bool]] = {}
+    # 2. 解析已完成的題目（per run）：file|question_id -> 該題每個 sample 的結果紀錄。
+    #    samples_per_question > 1 時同一題會有多列，必須全部保留，否則回填時
+    #    只算到一個 sample，accuracy 與 pass@k 都會失真；IFEval / ASR 的附加指標
+    #    也需要原始欄位才能回填（見 Evaluator.evaluate_file）。
+    completed: dict[str, dict[str, list[dict[str, Any]]]] = {}
     legacy_rows = 0  # 舊版結果檔沒有 file 欄位，無法比對來源檔案
     for result_file in existing_files:
         run_key = os.path.basename(result_file)
@@ -732,12 +795,14 @@ def _handle_resume(config_path: str, timestamp: str, export_formats: list[str]) 
                         legacy_rows += 1
                         continue
                     q_id = str(record.get("question_id", ""))
-                    completed[run_key][f"{file_id}|{q_id}"] = bool(record.get("is_correct", False))
+                    completed[run_key].setdefault(f"{file_id}|{q_id}", []).append(
+                        _resume_backfill_fields(record)
+                    )
         except Exception as e:
             print(f"⚠️  讀取 {result_file} 時發生錯誤：{e}")
 
     total_completed = sum(len(v) for v in completed.values())
-    print(f"📋 找到 {len(existing_files)} 個結果檔案，共 {total_completed} 筆已完成紀錄")
+    print(f"📋 找到 {len(existing_files)} 個結果檔案，共 {total_completed} 題已完成紀錄")
     if legacy_rows:
         print(
             f"⚠️  有 {legacy_rows} 筆舊格式紀錄缺少 file 欄位，無法比對，"
@@ -1004,7 +1069,7 @@ def main() -> int:
             log_error(f"基準測試執行錯誤: {e}")
             return 1
 
-    # --validate：僅驗證設定檔與資料集格式
+    # --validate：驗證設定檔與資料集格式，並對 API 端點試打一次
     if args.validate:
         return _handle_validate(args.config)
 
