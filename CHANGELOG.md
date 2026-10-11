@@ -5,6 +5,172 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] - 2026-09-15
+
+> ⚠️ **視覺評測的分數會上升。** `mmbench`、`mmstar`、`mmmu`、`pope`、`vistw_mcq`
+> 都受 #166 的修復影響——先前抓不到的答案現在讀得到了。與舊版分數不可直接比較。
+
+### Added
+- **VisTW 繁體中文台灣在地視覺語言評測**（Milestone #23，arXiv 2503.10427，CC BY 4.0）。
+  這是本專案第一個繁中視覺評測——既有的 MMBench、MMStar、MMMU、POPE 全是英文或簡體中文為主。
+  - **MCQ 子集**（21 學科）：沿用既有的 `vision_mcq`，不新增評測方法。兩個協定範本：
+    `vistw_mcq.yaml`（要求 `\boxed{}`，本專案協定）與 `vistw_mcq_native.yaml`（官方
+    `BASELINE_PROMPT` 逐字，用於對比 leaderboard）
+  - **Dialogue 子集**：新增 `vistw_dialogue`（生成）與 `vistw_judge`（LLM judge 0–10 分）
+    兩個評測方法。兩階段都走既有的 evaluator 路徑，evaluator 未改動
+  - `scripts/build_vistw_judge_dataset.py`、example 資料集、`docs/evals/vistw.md`
+
+### Fixed
+- **`VisionMCQExtractor` 抓不到 `答案: $A`**（#166）：官方 VisTW 的 prompt 教模型輸出
+  「答案: $字母」，模型照抄那個 `$`。更嚴重的是抓不到之後會退而用較寬鬆的 pattern
+  **抓到推理文字中的其他字母，把正確作答判成答錯**——那比 unparsed 危險，因為它不會
+  出現在 `unparsed_rate` 裡。現比照官方在比對前剝掉 `$`。
+  實測 253 題：75.89%（11 題 unparsed）→ **81.82%（0 題 unparsed）**。
+- **`--benchmark` 因缺少 `import copy` 而 `NameError` 崩潰**（#161/#162）：2.9.0 移除
+  `main.py` 的 runner class 時把 `import copy` 一併帶走，而 `--benchmark` 的金鑰清理
+  還在用它。
+
+### Changed
+- VisTW 範本的 `max_tokens` 2048 → 8192。推理型 VLM（如 gemma 4）會在寫出答案前用掉
+  大量 token，實測 2048 時 19% 因截斷而 unparsed、分數低估 19 個百分點；不設上限則會
+  推理到代理層逾時。
+
+### 對比驗證
+與官方實作（TMMMU-Benchmark/evaluation）在相同模型、相同端點、相同 253 題下對比：
+**Twinkle Eval 81.01% vs 官方 80.56%，差 0.45 個百分點**，在 §6.3 的 ±2% 容差內。
+完整方法與四項對齊修改記錄於 `docs/evals/vistw.md` §6。
+
+## [2.9.0] - 2026-09-13
+
+> ⚠️ **本版會改變評測分數。** 修正了題目 metadata 欄位被送進 prompt 的問題（#143）。
+> 含 `id` / `domain` / `discipline` / `subfield` / `category` 等欄位的資料集
+> （GPQA、SuperGPQA、MMLU-Redux、vision_mcq）分數預期會**下降**，因為先前的 prompt
+> 夾帶了學科分類，等同免費提示。與舊版分數不可直接比較，請重跑基準。
+
+### Added
+- `twinkle_eval.datasets.index_to_label()`：`_index_to_label()` 提升為公開 API（保留舊名稱別名）
+- `runners.evaluator.detect_option_keys()`：動態偵測選項鍵，支援任意數量選項
+- `runners.evaluator.build_question_text()`：統一三條路徑的題目組建邏輯
+- `runners.evaluator.describe_dropped_fields()`：每個檔案提示一次哪些非選項欄位不會進入
+  prompt，讓「作答必需的欄位（hint、context）被靜默丟棄」變成可觀察，而非無聲的分數下降
+- `tests/test_shuffle_options.py`：38 個測試，涵蓋選項偵測、重排、prompt 組建、語意標籤保護
+  與 runner 單一實作
+
+### Fixed
+- **題目 metadata 被當成選項送進 prompt**（#143）：文字與 logit 路徑以
+  「排除 `question` / `answer` 後其餘欄位全印」的方式組題目，導致 `id`、`domain`、
+  `discipline`、`category` 等欄位進入 prompt。這既是雜訊，學科分類欄位更等同答題提示。
+  **`shuffle_options` 預設為 `false`，預設路徑即受影響**，此行為自 2.8.0 以前即存在。
+  現改為：偵測得到選項鍵時只列出選項；偵測不到時（Text-to-SQL 等）維持列出其餘欄位，
+  因為 `db_id` / `evidence` 本來就該進 prompt。vision 路徑一併統一（原本漏排除 `category`）。
+  **僅解決選擇題路徑**——沒有選項鍵的資料集（NIAH 洩漏 `needle_depth`、RAGAS 洩漏
+  `answer_type`、BBH 洩漏 `subtask`）仍有同類問題，需要區分「哪些非選項欄位該進 prompt」，
+  另行追蹤於 #146。
+- **選項重排硬編碼 A/B/C/D**（#140）：`shuffle_question_options()` 的註解宣稱動態偵測，
+  實作仍寫死 `["A","B","C","D"]`（違反 §2 原則 C）。MMLU-Pro（A–J）、SuperGPQA（4–10 選項）
+  開啟 `shuffle_options: true` 時，E 之後的選項被靜默丟棄；正解落在 E–J 時 `answer` 無法回填，
+  該題直接被跳過。現以 `detect_option_keys()` 動態偵測，並對未從 A 起始的選項鍵
+  （如 T/F、Y/N）提供單字元回退。這類標籤帶有語意，**不會被重排**——重排會讓 `T` 指向「否」，
+  使正確作答被判為錯。偵測結果少於兩個選項時視為沒有選項，避免單一 `A` 欄位讓其餘欄位
+  （如 `context`）被丟棄。
+- **選項重排丟棄非選項欄位**（#141）：重排時從空 dict 重建題目，`image_path` / `id` 等欄位
+  全部遺失。vision 路徑在重排後才讀圖片欄位，導致 `vision_mcq` + `shuffle_options: true`
+  每題都被 skip、**評測到零題**。現以 `dict(question_data)` 為基底，只覆寫選項鍵與 `answer`。
+- 選項重排改以「原始選項鍵」而非選項文字定位正解，修正兩個選項文字相同時 `answer`
+  指向錯誤選項的問題。
+- 無法在選項鍵中定位正解時原樣回傳不重排（取代原本回填失敗後拋 KeyError 被跳過的行為），
+  並降為 warning——這是資料格式問題，不是執行錯誤。
+
+### Changed
+- **`TwinkleEvalRunner` 去重**（#142）：`main.py` 與 `runners/standard.py` 各有一份實作且已分歧
+  （相似度約 68%）。`main.py` 那份是實際被使用的、且是功能超集（多了 `--resume` 的
+  `completed_records` 參數），`runners/standard.py` 則是無人 import 的死程式碼。
+  註：`--resume` 本身目前是壞的（JSONL 缺 `file` 欄位，見 #145），此處只是忠實保留既有行為。
+  現以 `main.py` 的實作為準搬入 `runners/standard.py`，`main.py` 改為重新匯出，符合 §4
+  「main.py 不實作具體評測邏輯」。`twinkle_eval`、`twinkle_eval.main`、`twinkle_eval.runners`、
+  `twinkle_eval.runners.standard` 四條 import 路徑皆維持可用（原則 F），行為不變。
+- `results_{timestamp}.json` 的 `accuracy_std` 在 `repeat_runs: 1` 時由 `0` 改為 `0.0`
+  （搬移時採用明確的 `float()` 轉型）。JSON number 語意相同，下游 parser 不受影響。
+
+<!-- 以下來自 #160（system_prompt），與本版一同釋出 -->
+### Fixed
+- **`evaluation.system_prompt` 只對 `box` 與 `math` 生效**（#144）：`_build_messages()` 以
+  `method in {"box", "math"}` 的硬編碼白名單決定是否送出，其餘方法即使設了也不進 request。
+  `templates/regex_match.yaml` 這個官方範本自己就設了一段指定輸出格式的 prompt 卻從未送出，
+  使用者照範本設定反而得到爆高的 `unparsed_rate` 且無從得知原因。
+  改為：只要設了非空 `system_prompt` 且 `system_prompt_enabled` 為真就送出。
+- **vision 路徑在任何設定下都送不出 system prompt**：它不經過 `_build_messages()`，
+  evaluator 自己組 multimodal messages 直接傳給 `call()`。`_build_vision_messages()`
+  新增 optional 的 `system_prompt` 參數。
+- `templates/regex_match.yaml` 補上 `datasets_prompt_map`。該範本只定義 `en` 鍵，而
+  `prompt_lang` 預設為 `zh`，所以即使移除白名單，prompt 仍然送不出去。
+
+### Changed
+- **設了 `system_prompt` 的非 box/math 設定，現在該 prompt 會真的送達模型**，分數會變動。
+  這是修復而非副作用——那些設定本來就預期 prompt 會被送出。`regex_match` 使用者應預期
+  `unparsed_rate` 下降。
+- **`box` / `math` 在未設 `system_prompt` 時不再送出 `content` 為空字串的 system message。**
+  舊版會送出空的 system block，多數 chat template 仍會渲染它，因此這可能使既有的
+  box / math 分數有小幅變動。
+- system prompt 的語言解析改為區分「鍵不存在」與「鍵存在但為空」：前者依序回退 `zh`、
+  再回退唯一已定義的語言；後者視為該語言明確不要 prompt，**不跨語言回退**。
+  先前的 `or` 串接會讓 `{zh: "中文", en: null}` 搭配英文資料集收到中文 prompt。
+
+## [2.8.1] - 2026-09-11
+
+本版為 PR #136（`Fix/audit bugfix batch`，作者 @dave-apmic）前半段的獨立修復批次，
+內容為不改變評測分數的 bug fix。原 PR 的其餘部分（evaluator 重構、question-level
+resume、新 feature）另行審查。
+
+### Fixed
+- **API 金鑰寫入 benchmark 結果檔**（原則 E 破口）：`--benchmark` 的輸出路徑未經
+  `_prepare_config_for_saving()` 清理，完整的 `llm_api.api_key` 會被寫進
+  `benchmark_results_*.json`。同時修正 `_prepare_config_for_saving()` 會就地刪除
+  `self.config["llm_instance"]` 的問題——那讓同一個 runner 無法重複執行
+  （第二次 `run_evaluation()` 會 `KeyError`）。
+- **`finalize` 刪除合併後的 JSONL**（原則 D 資料遺失）：rank0 的 shard 路徑與合併輸出
+  路徑相同，shard 清理會把剛合併好的結果檔一併刪掉。
+- **HTML exporter 在 `usage_total_tokens` 為 `None` 時崩潰**（`TypeError: int + NoneType`）。
+  同時修正 `llm_resoning_output` 的拼字，使推理輸出能正確顯示——writer 寫出的一直是
+  正確拼字的鍵，exporter 讀的是一個從不存在的鍵。
+- **HTML 報告未轉義模型輸出**：`question`、`correct_answer`、`predicted_answer`、
+  `llm_output`、`reasoning` 現在都經過 `html.escape()`。先前模型回應中若含 `<script>`
+  或任何標籤，會破壞報告版面或直接注入頁面。
+- **`cli.py` 的 `sys.path` hack 遮蔽 HuggingFace `datasets` 套件**：`import datasets` 會
+  解析到專案內的 `twinkle_eval/datasets/`，造成循環 import 錯誤。
+- **text2sql 的 SQL 執行逾時從未生效**：`execute_sql()` 收到 `text2sql_timeout` 後並未實際套用到 sqlite。
+- **gated dataset 檢查的運算子優先序錯誤**：`A and B or C` 導致任何含 `403` 的錯誤都被
+  當成 gated dataset 而靜默略過。
+- **`logs/` 目錄在每次 CLI 呼叫時都被建立**（改為延遲初始化），以及 log 檔名的同分鐘碰撞
+  （時間戳加到秒）。
+
+### Changed
+- **`--dry-run` 與評測啟動不再進行 Google 服務的連線檢查**。原本這些網路呼叫發生在
+  `ConfigurationManager.load_config()`，違反 §4「config.py 不做 API 呼叫」與 §12
+  「`--dry-run` 不呼叫 API」。憑證檔案的格式驗證（存在、JSON 合法、必要欄位、
+  `type == "service_account"`）全部保留。
+  ⚠️ 代價：原本在評測開始前就會擋下的「資料夾不存在或未共享」診斷（含 Service Account
+  email 與三步解法）不再出現，該失敗改為在評測結束的上傳階段才以 log 呈現。
+- **Google Sheets 匯出移除 `API_金鑰` 欄位**（30 → 29 欄）。
+  ⚠️ 既有試算表的歷史列仍保有截斷的金鑰，且在新表頭下會位移一欄，建議封存或清空舊表。
+- **`--download-dataset` 對非 gated 的 403 錯誤現在會以 exit 1 結束**，先前會靜默略過。
+- **text2sql 的 EX 評分現在真的會在 `text2sql_timeout`（預設 30 秒）中止**。
+  ⚠️ 若 gold SQL 本身逾時，該題會退回 Exact Match 評分，可能使 text2sql 分數有小幅變動。
+
+### 注意
+- 秒級時間戳**只套用到 log 檔名**。`results_{timestamp}.json` 與
+  `eval_results_{timestamp}_run{N}.jsonl` 仍為分鐘精度，同分鐘啟動兩次評測會出問題，
+  而且兩個檔案的失效方式不同：
+
+  | 檔案 | 同分鐘第二次執行 |
+  |------|----------------|
+  | `results_{timestamp}.json` | **被覆蓋**，第一次的結果消失 |
+  | `eval_results_{timestamp}_run{N}.jsonl` | **累加**（append 模式），兩次的紀錄混在同一檔 |
+
+  JSONL 的情況更麻煩：資料沒有遺失，但 `results_*.json` 的 `individual_runs.results`
+  仍指向那個檔案，任何從 JSONL 重算正確率的下游工具都會**重複計數**。
+  runner 端的時間戳變更屬於 PR #136 後半段（輸出檔名變更需依 §7 先行討論）。
+
 ## [2.8.0] - 2026-04-10
 
 ### Added

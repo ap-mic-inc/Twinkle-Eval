@@ -18,6 +18,8 @@ from twinkle_eval.exporters import ResultsExporterFactory
 from twinkle_eval.metrics import create_metric_pair
 from twinkle_eval.runners.evaluator import Evaluator
 
+__all__ = ["TwinkleEvalRunner"]
+
 
 class TwinkleEvalRunner:
     """Twinkle Eval 主要執行器類別 - 負責控制整個評測流程。"""

@@ -2,41 +2,26 @@ import inspect
 import json
 import os
 import random
-import string
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import comb
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from tqdm import tqdm
 
 from twinkle_eval.core.abc import Extractor, Scorer
-from twinkle_eval.core.logger import log_error
-from twinkle_eval.datasets import Dataset
+from twinkle_eval.core.logger import log_error, log_warning
+from twinkle_eval.datasets import Dataset, index_to_label
 from twinkle_eval.metrics.extractors.bfcl_prompt import inject_bfcl_system_prompt
 from twinkle_eval.metrics.extractors.tool_call import convert_bfcl_functions_to_tools
 from twinkle_eval.models import LLM
+from twinkle_eval.core.prompts import resolve_system_prompt
 
 
 def _get_node_id() -> str:
     """取得當前節點識別碼，優先使用 SLURM_NODEID，否則回退至 node0。"""
     slurm_node = os.environ.get("SLURM_NODEID")
     return slurm_node if slurm_node is not None else "0"
-
-
-def _excel_label(idx: int) -> str:
-    """將 0-based 索引轉換為 Excel 風格的大寫字母標籤（A…Z、AA…AZ、BA…）。
-
-    與 datasets 模組的 choices 展開邏輯一致。
-    """
-    letters = []
-    while True:
-        idx, rem = divmod(idx, 26)
-        letters.append(string.ascii_uppercase[rem])
-        if idx == 0:
-            break
-        idx -= 1
-    return "".join(reversed(letters))
 
 
 _THINK_TAG_PAIRS = [
@@ -64,6 +49,86 @@ def _get_reasoning_text(message: Any) -> Optional[str]:
     if reasoning is None:
         reasoning = getattr(message, "reasoning_content", None)
     return reasoning
+
+
+def detect_option_keys(question_data: Dict[str, Any]) -> List[str]:
+    """動態偵測題目字典中的選項鍵，依標籤順序回傳（A、B、…、Z、AA、AB、…）。
+
+    以 ``index_to_label()`` 產生的標準標籤序列由 A 開始逐一比對，遇到第一個
+    缺口即停止。這樣可支援任意數量的選項（如 MMLU-Pro 的 A–J），同時避免把
+    ``ID`` 這類剛好是大寫短字串的中繼資料欄位誤判為選項。
+
+    Args:
+        question_data: 題目字典。
+
+    Returns:
+        依標籤順序排列的選項鍵列表；無選項時回傳空列表。
+    """
+    # 單一大寫字母一律視為候選選項鍵（涵蓋 A–D、不連續的 A/B/C/E、
+    # 以及 T/F、Y/N 這類非 A 起始的標籤）。
+    singles = {k for k in question_data if isinstance(k, str) and len(k) == 1 and k.isupper()}
+
+    # 多字母標籤（AA、AB…）只在它延續標準序列時才算選項，
+    # 藉此排除 ID、NO 這類剛好是兩個大寫字母的 metadata 欄位。
+    ordered: List[str] = []
+    idx = 0
+    while True:
+        label = index_to_label(idx)
+        if label not in question_data:
+            break
+        ordered.append(label)
+        idx += 1
+
+    extras = sorted(singles - set(ordered))
+    keys = ordered + extras
+    return keys if len(keys) >= 2 else []
+
+
+def describe_dropped_fields(
+    question_data: Dict[str, Any],
+    exclude: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """回傳 ``build_question_text()`` 會略過的非選項欄位名稱。
+
+    用於每個檔案發出一次提示，讓「某個作答必需的欄位（如 hint、context）被丟棄」
+    這種靜默的分數下降變得可觀察。
+    """
+    keys = detect_option_keys(question_data)
+    if not keys:
+        return []
+    skip = {"question", "answer", *keys, *(exclude or ())}
+    return [k for k in question_data if k not in skip]
+
+
+def build_question_text(
+    question_data: Dict[str, Any],
+    option_keys: Optional[List[str]] = None,
+    exclude: Optional[Iterable[str]] = None,
+) -> str:
+    """組出送給模型的題目文字：題幹 + 選項。
+
+    偵測得到選項鍵時**只列出選項**。這是為了避免 ``id`` / ``domain`` /
+    ``discipline`` / ``category`` 這類 metadata 欄位被當成選項送進 prompt——
+    那既是雜訊，其中的學科分類欄位更等同於免費提示，會高估分數（見 #143）。
+
+    偵測不到選項鍵時（Text-to-SQL 等非選擇題）維持列出其餘所有欄位，
+    因為 ``db_id`` / ``evidence`` 這類欄位本來就該進 prompt。
+
+    Args:
+        question_data: 題目字典。
+        option_keys:   已算好的選項鍵；None 表示由本函式偵測。
+        exclude:       無選項鍵時額外要排除的欄位（如圖片路徑欄位）。
+
+    Returns:
+        題幹加上選項（或其餘欄位）的完整題目文字。
+    """
+    keys = detect_option_keys(question_data) if option_keys is None else option_keys
+    if keys:
+        body = "\n".join(f"{k}: {question_data[k]}" for k in keys)
+    else:
+        skip = {"question", "answer", *(exclude or ())}
+        body = "\n".join(f"{k}: {v}" for k, v in question_data.items() if k not in skip)
+    return question_data["question"] + "\n" + body
 
 
 #: 編碼圖片時的最大檔案大小（bytes），預設 50 MB。
@@ -169,9 +234,18 @@ def _build_vision_messages(
     image_url: str,
     question_text: str,
     image_detail: str = "auto",
+    system_prompt: Optional[str] = None,
 ) -> list:
-    """建構 OpenAI multimodal messages（image_url + text）。"""
-    return [
+    """建構 OpenAI multimodal messages（image_url + text）。
+
+    vision 路徑不經過 ``OpenAIModel._build_messages()``——evaluator 自己組好
+    messages 直接傳給 ``call()``——所以 system prompt 必須在這裡加入，否則
+    ``evaluation.system_prompt`` 對視覺評測完全無效（#144 的另一半）。
+    """
+    messages: list = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append(
         {
             "role": "user",
             "content": [
@@ -182,7 +256,8 @@ def _build_vision_messages(
                 {"type": "text", "text": question_text},
             ],
         }
-    ]
+    )
+    return messages
 
 
 class RateLimiter:
@@ -288,62 +363,46 @@ class Evaluator:
 
     # ── 共用輔助 ────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _detect_option_keys(question_data: dict) -> list:
-        """動態偵測選項鍵（避免硬編碼 A/B/C/D）。
-
-        只接受從 A 開始、依 Excel 風格標籤（A…Z、AA、AB…）連續出現的鍵，
-        避免 ID、NO 之類的大寫 metadata 欄位被誤判為選項。
-        """
-        candidates = {
-            k for k in question_data if isinstance(k, str) and k.isupper() and len(k) <= 2
-        }
-        option_keys: list = []
-        idx = 0
-        while True:
-            label = _excel_label(idx)
-            if label not in candidates:
-                break
-            option_keys.append(label)
-            idx += 1
-        return option_keys
-
     def shuffle_question_options(self, question_data: dict) -> dict:
-        option_keys = self._detect_option_keys(question_data)
+        """隨機重排題目選項，消除模型對選項位置的偏好。
 
-        if not option_keys:
+        選項鍵動態偵測（見 ``detect_option_keys``），支援任意數量的選項；
+        非選項欄位（``image_path``、``id`` 等）原樣保留。
+
+        若無法在選項鍵中定位正解（``answer`` 缺失、非字母標籤、或指向不存在的
+        選項），則原樣回傳不做重排——重排後無法回填正解等同於毀損題目。
+        """
+        option_keys = detect_option_keys(question_data)
+        if len(option_keys) < 2:
             return question_data
 
-        correct_ans = question_data.get("answer")
-        if correct_ans not in option_keys:
-            log_error("shuffle_options: 題目缺少 answer 欄位或 answer 不是選項鍵，跳過選項重排")
+        # 只有 A 起始的位置性標籤才可重排。T/F、Y/N 這類標籤本身帶有語意，
+        # 重排會讓標籤與內容錯位（T 指向「否」），使正確作答被判為錯。
+        if option_keys != [index_to_label(i) for i in range(len(option_keys))]:
             return question_data
 
-        shuffled_keys = option_keys[:]
-        random.shuffle(shuffled_keys)
+        correct_key = str(question_data.get("answer", "")).strip().upper()
+        if correct_key not in option_keys:
+            log_warning(
+                f"跳過選項重排：answer={question_data.get('answer')!r} "
+                f"不在偵測到的選項鍵 {option_keys} 中"
+            )
+            return question_data
 
-        # 保留所有其他欄位（id、image_path 等），僅重排選項內容並同步更新答案
+        # 以「原始鍵」而非選項文字定位正解，避免兩個選項文字相同時比對到錯誤選項
+        correct_index = option_keys.index(correct_key)
+        texts = [question_data[k] for k in option_keys]
+
+        order = list(range(len(option_keys)))
+        random.shuffle(order)
+
         new_data = dict(question_data)
-        for new_key, old_key in zip(option_keys, shuffled_keys):
-            new_data[new_key] = question_data[old_key]
-            if old_key == correct_ans:
-                new_data["answer"] = new_key
+        for new_pos, old_index in enumerate(order):
+            new_data[option_keys[new_pos]] = texts[old_index]
+            if old_index == correct_index:
+                new_data["answer"] = option_keys[new_pos]
 
         return new_data
-
-    def _compose_question_text(self, q: dict, option_keys: list, exclude: tuple = ()) -> str:
-        """組合題目文字。
-
-        MCQ 題（有選項鍵）只帶入選項內容，避免 id、subject 等 metadata 欄位
-        被當成選項渲染進 prompt；自由作答題（無選項鍵）保留除 question/answer
-        以外的所有欄位（如 text2sql 的 db_id、evidence 需要進入 prompt）。
-        """
-        if option_keys:
-            lines = [f"{k}: {q[k]}" for k in option_keys]
-        else:
-            excluded = {"question", "answer", *exclude}
-            lines = [f"{k}: {v}" for k, v in q.items() if k not in excluded]
-        return q["question"] + "\n" + "\n".join(lines)
 
     def _iter_questions(
         self,
@@ -427,6 +486,28 @@ class Evaluator:
                            set（僅 question_id 字串）時只跳過、不回填。
         """
         dataset = Dataset(file_path)
+        # 每個檔案提示一次：哪些非選項欄位不會進入 prompt。
+        # 這些欄位多半是 metadata（id、domain），但若資料集把作答必需的內容
+        # （hint、context）放在選項之外，就會被靜默丟棄而使分數無故下降。
+        if dataset.data:
+            vision_cfg = getattr(self.extractor, "_config", {}) or {}
+            extra_exclude = (
+                (vision_cfg.get("image_field", "image_path"), "image_url", "image")
+                if getattr(self.extractor, "uses_vision", False)
+                else ()
+            )
+            dropped = describe_dropped_fields(dataset.data[0], extra_exclude)
+            if dropped:
+                notice = (
+                    f"ℹ️  {file_path}：以下欄位不會進入 prompt（只列出選項）："
+                    f"{', '.join(dropped)}。"
+                    "若其中含作答必需的內容（如 hint、context），請改寫進 question 欄位。"
+                )
+                # logger 只寫入 logs/ 檔案（basicConfig 未設 StreamHandler），
+                # 而這個提示的目的正是讓靜默的分數下降被看見，所以同時印到終端機
+                print(notice)
+                log_warning(notice)
+
         acc = _EvalAccumulator()
 
         # --resume：回填先前已完成題目的結果（不重寫 JSONL），
@@ -556,8 +637,8 @@ class Evaluator:
         question_records = []
 
         for idx, q in self._iter_questions(dataset, completed_ids):
-            option_keys = self._detect_option_keys(q)
-            question_text = self._compose_question_text(q, option_keys)
+            option_keys = detect_option_keys(q)
+            question_text = build_question_text(q, option_keys)
             logit_context = question_text + "\nAnswer:"
 
             try:
@@ -1081,7 +1162,7 @@ class Evaluator:
         future_to_data: Dict[Any, Any] = {}
 
         for idx, q in self._iter_questions(dataset, completed_ids):
-            option_keys = self._detect_option_keys(q)
+            option_keys = detect_option_keys(q)
 
             image_path = q.get(image_field) or q.get("image_url") or q.get("image")
             if not image_path:
@@ -1095,7 +1176,7 @@ class Evaluator:
                 continue
 
             # 建構文字題目（與文字 MCQ 相同邏輯：question + 選項）
-            question_text = self._compose_question_text(
+            question_text = build_question_text(
                 q, option_keys, exclude=(image_field, "image_url", "image", "id")
             )
 
@@ -1106,7 +1187,16 @@ class Evaluator:
                 log_error(f"問題 {idx + 1} 圖片載入失敗: {e}")
                 continue
 
-            messages = _build_vision_messages(image_url, question_text, image_detail)
+            messages = _build_vision_messages(
+                image_url,
+                question_text,
+                image_detail,
+                system_prompt=resolve_system_prompt(
+                    self.config.get("evaluation", {}),
+                    prompt_lang,
+                    self.system_prompt_enabled,
+                ),
+            )
 
             self.rate_limiter.wait()
             # Vision 路徑使用預先建構的 multimodal messages，
@@ -1175,8 +1265,8 @@ class Evaluator:
         future_to_data: Dict[Any, Any] = {}
 
         for idx, q in self._iter_questions(dataset, completed_ids):
-            option_keys = self._detect_option_keys(q)
-            question_text = self._compose_question_text(q, option_keys)
+            option_keys = detect_option_keys(q)
+            question_text = build_question_text(q, option_keys)
 
             try:
                 correct_answer = self.scorer.normalize(q["answer"])
