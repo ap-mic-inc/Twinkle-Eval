@@ -6,7 +6,6 @@
 """
 
 import json
-import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -47,6 +46,11 @@ def dataset_file(tmp_path):
     return str(path)
 
 
+def _row(is_correct: bool) -> dict:
+    """main._resume_backfill_fields 產生的回填紀錄格式。"""
+    return {"is_correct": is_correct, "unparsed": False}
+
+
 def _run(dataset_file, tmp_path, monkeypatch, completed_ids):
     monkeypatch.chdir(tmp_path)
     llm = MagicMock()
@@ -71,7 +75,10 @@ def _run(dataset_file, tmp_path, monkeypatch, completed_ids):
 class TestResumeDedup:
     def test_completed_dict_skips_and_backfills(self, dataset_file, tmp_path, monkeypatch):
         llm, metrics, rows = _run(
-            dataset_file, tmp_path, monkeypatch, completed_ids={"0": True, "2": False}
+            dataset_file,
+            tmp_path,
+            monkeypatch,
+            completed_ids={"0": [_row(True)], "2": [_row(False)]},
         )
 
         # 只有 question_id=1 應被實際評測與寫入
@@ -80,14 +87,6 @@ class TestResumeDedup:
         # 但統計要涵蓋整個資料集（已完成的 0/2 回填進 accuracy）
         assert metrics["total_count"] == 3
         assert metrics["accuracy"] == pytest.approx(2 / 3)
-
-    def test_completed_set_skips_without_backfill(self, dataset_file, tmp_path, monkeypatch):
-        # set 形式僅跳過、不回填統計
-        llm, metrics, rows = _run(dataset_file, tmp_path, monkeypatch, completed_ids={"0", "2"})
-
-        assert llm.call.call_count == 1
-        assert metrics["total_count"] == 1
-        assert [r["question_id"] for r in rows] == [1]
 
     def test_no_completed_ids_runs_all(self, dataset_file, tmp_path, monkeypatch):
         llm, metrics, rows = _run(dataset_file, tmp_path, monkeypatch, completed_ids=None)
@@ -106,7 +105,10 @@ class TestResumeDedup:
         self, dataset_file, tmp_path, monkeypatch
     ):
         llm, metrics, rows = _run(
-            dataset_file, tmp_path, monkeypatch, completed_ids={"0": True, "1": True, "2": False}
+            dataset_file,
+            tmp_path,
+            monkeypatch,
+            completed_ids={"0": [_row(True)], "1": [_row(True)], "2": [_row(False)]},
         )
 
         # 不再呼叫 API、不重寫 JSONL，但 summary 統計完整
