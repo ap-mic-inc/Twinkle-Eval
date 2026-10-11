@@ -11,9 +11,9 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+from twinkle_eval.core import logger as logger_module
 from twinkle_eval.core.abc import ResultsExporter
 from twinkle_eval.core.exceptions import ConfigurationError
-from twinkle_eval.core import logger as logger_module
 from twinkle_eval.core.logger import log_error, log_info
 
 

@@ -263,6 +263,9 @@ class ConfigValidator:
                         "dataset_overrides.shuffle_options must be a boolean when provided"
                     )
                 for mk in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
+                    # temperature / top_p 可為 null（不送出該參數），與 model 區段一致
+                    if mk in ("temperature", "top_p") and mk in value and value[mk] is None:
+                        continue
                     if mk in value and not isinstance(value[mk], (int, float)):
                         raise ValidationError(
                             f"dataset_overrides.{mk} must be a number when provided"

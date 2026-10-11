@@ -4,6 +4,7 @@ import os
 import time
 from typing import Any
 
+from .core import logger as logger_module
 from .core.config import load_config
 from .core.logger import log_error
 from .datasets import find_all_evaluation_files
@@ -569,7 +570,11 @@ def _ping_llm(live_config: dict[str, Any]) -> str | None:
         if getattr(extractor, "uses_logprobs", False):
             score = llm_instance.score_continuation("ping", " A")
             if score == float("-inf"):
-                return "completions 端點無法回傳 logprobs（logit 評測需要 echo + logprobs 支援）"
+                # score_continuation 出錯時只記錄 log 並回傳 -inf，實際錯誤需到 log 檔查看
+                return (
+                    "無法從 completions 端點取得 logprobs（連線失敗，或端點不支援 echo + logprobs）"
+                    f"，詳細錯誤見 {logger_module.log_filename}"
+                )
             print("✅ API 端點試打成功（completions logprobs）")
             return None
         # max_tokens 至少 16：Responses API 的 max_output_tokens 下限為 16

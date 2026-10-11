@@ -5,6 +5,7 @@ main.py 保持作為 CLI 入口，此處為核心執行邏輯（CLAUDE.md §4 �
 
 import copy
 import os
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -50,9 +51,7 @@ class TwinkleEvalRunner:
             # 時間標記（秒級，避免同分鐘的兩次評測互相覆蓋）。分散式腳本
             # （scripts/run_slurm_*.sh）會以 TWINKLE_EVAL_RUN_TIMESTAMP 指定，讓各節點
             # 寫入同一組檔名，之後才能以該時間戳執行 --finalize-results
-            self.start_time = os.environ.get(
-                "TWINKLE_EVAL_RUN_TIMESTAMP"
-            ) or datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.start_time = self._resolve_run_timestamp()
             self.start_datetime = datetime.now()  # 記錄開始時間
 
             os.makedirs(self.results_dir, exist_ok=True)  # 建立結果目錄
@@ -62,6 +61,28 @@ class TwinkleEvalRunner:
         except Exception as e:
             log_error(f"初始化失敗: {e}")
             raise
+
+    @staticmethod
+    def _resolve_run_timestamp() -> str:
+        """取得本次評測的時間標記。
+
+        設有 TWINKLE_EVAL_RUN_TIMESTAMP 時採用它（分散式腳本以此讓各節點共用同一組檔名），
+        並明確提示：殘留在 shell 中的這個變數會讓每次評測寫入同一組結果檔。
+        """
+        env_ts = os.environ.get("TWINKLE_EVAL_RUN_TIMESTAMP")
+        if env_ts:
+            if not re.fullmatch(r"\d{8}_\d{4}(\d{2})?", env_ts):
+                raise ConfigurationError(
+                    f"TWINKLE_EVAL_RUN_TIMESTAMP 格式錯誤：{env_ts!r}（應為 YYYYmmdd_HHMMSS）"
+                )
+            msg = (
+                f"ℹ️  使用環境變數 TWINKLE_EVAL_RUN_TIMESTAMP={env_ts} 作為時間標記，"
+                "結果會寫入（並覆蓋）同一組檔名"
+            )
+            print(msg)
+            log_info(msg)
+            return env_ts
+        return datetime.now().strftime("%Y%m%d_%H%M%S")
 
     def _prepare_config_for_saving(self) -> Dict[str, Any]:
         """準備用於儲存的配置資料，移除敏感資訊

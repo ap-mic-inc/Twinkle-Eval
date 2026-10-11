@@ -211,3 +211,62 @@ def test_responses_finish_reason(status, reason, tool_calls, expected):
         incomplete_details=SimpleNamespace(reason=reason) if reason else None,
     )
     assert OpenAIResponsesModel._finish_reason(response, tool_calls) == expected
+
+
+# ── 時間標記與 dataset_overrides ─────────────────────────────────────────────
+
+
+def test_run_timestamp_from_env(monkeypatch, capsys):
+    from twinkle_eval.runners.standard import TwinkleEvalRunner
+
+    monkeypatch.setenv("TWINKLE_EVAL_RUN_TIMESTAMP", "20260101_120000")
+    assert TwinkleEvalRunner._resolve_run_timestamp() == "20260101_120000"
+    assert "TWINKLE_EVAL_RUN_TIMESTAMP" in capsys.readouterr().out
+
+
+def test_run_timestamp_rejects_malformed_env(monkeypatch):
+    from twinkle_eval.core.exceptions import ConfigurationError
+    from twinkle_eval.runners.standard import TwinkleEvalRunner
+
+    monkeypatch.setenv("TWINKLE_EVAL_RUN_TIMESTAMP", "yesterday")
+    with pytest.raises(ConfigurationError):
+        TwinkleEvalRunner._resolve_run_timestamp()
+
+
+def test_run_timestamp_defaults_to_seconds(monkeypatch):
+    import re
+
+    from twinkle_eval.runners.standard import TwinkleEvalRunner
+
+    monkeypatch.delenv("TWINKLE_EVAL_RUN_TIMESTAMP", raising=False)
+    assert re.fullmatch(r"\d{8}_\d{6}", TwinkleEvalRunner._resolve_run_timestamp())
+
+
+def test_dataset_override_sampling_params_may_be_null():
+    config = _config(evaluation={"dataset_overrides": {"d/": {"temperature": None, "top_p": None}}})
+    assert ConfigValidator.validate_config_structure(config)
+
+
+def test_google_log_upload_includes_current_log(tmp_path, monkeypatch):
+    """runner 與 logger 的時間戳不同秒時，本次程序的 log 檔仍須被上傳。"""
+    pytest.importorskip("googleapiclient")
+    from twinkle_eval.core import logger as logger_module
+    from twinkle_eval.integrations.google import GoogleDriveUploader
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "evaluation_20260101_120001.log").write_text("current")
+    (logs / "evaluation_20250101_000000.log").write_text("old")
+    monkeypatch.setattr(logger_module, "log_filename", "logs/evaluation_20260101_120001.log")
+
+    uploader = GoogleDriveUploader.__new__(GoogleDriveUploader)
+    uploader.config = {}
+    uploader.create_folder = MagicMock(return_value="folder")
+    uploader.upload_file = MagicMock(return_value="file-id")
+
+    results = tmp_path / "results"
+    results.mkdir()
+    uploader.upload_latest_files("20260101_120000", str(logs), str(results))
+
+    uploaded = [call.args[0] for call in uploader.upload_file.call_args_list]
+    assert uploaded == [str(logs / "evaluation_20260101_120001.log")]
