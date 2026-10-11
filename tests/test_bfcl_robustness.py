@@ -34,10 +34,15 @@ def _row(i: int) -> dict:
     }
 
 
-def _completion(arguments: str, reasoning=None) -> SimpleNamespace:
-    tool_call = SimpleNamespace(function=SimpleNamespace(name="add", arguments=arguments))
+def _completion(*arguments, reasoning=None, reasoning_content=None) -> SimpleNamespace:
+    tool_calls = [
+        SimpleNamespace(function=SimpleNamespace(name="add", arguments=a)) for a in arguments
+    ]
     message = SimpleNamespace(
-        content=None, tool_calls=[tool_call], reasoning=reasoning, reasoning_content=None
+        content=None,
+        tool_calls=tool_calls,
+        reasoning=reasoning,
+        reasoning_content=reasoning_content,
     )
     return SimpleNamespace(
         choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
@@ -51,9 +56,12 @@ def _run(tmp_path, monkeypatch, responses):
     data.write_text("\n".join(json.dumps(_row(i)) for i in range(len(responses))))
 
     llm = MagicMock()
-    llm.call.side_effect = lambda *args, **kwargs: responses[
-        int(args[7][0]["content"].split(":")[0][1:])
-    ]
+
+    def call(*args, **kwargs):
+        messages = kwargs.get("messages", args[7] if len(args) > 7 else None)
+        return responses[int(messages[0]["content"].split(":")[0][1:])]
+
+    llm.call.side_effect = call
     extractor, scorer = create_metric_pair("bfcl_fc", {})
     evaluator = Evaluator(
         llm=llm,
@@ -89,14 +97,49 @@ def test_malformed_arguments_do_not_abort_the_file(tmp_path, monkeypatch):
     assert rows[1]["tool_calls"] == [{"name": "add", "arguments": '{"a": 1, "b":'}]
 
 
-def test_empty_arguments_are_treated_as_no_arguments(tmp_path, monkeypatch):
-    _, rows = _run(tmp_path, monkeypatch, [_completion("")])
-    assert rows[0]["predicted_answer"] is not None
+@pytest.mark.parametrize("arguments", ["5", "null", "[]", '"text"', "true"])
+def test_non_object_arguments_are_unparsed(tmp_path, monkeypatch, arguments):
+    """合法 JSON 但不是物件的參數不得讓 scorer 拋例外而中止檔案。"""
+    metrics, rows = _run(
+        tmp_path, monkeypatch, [_completion(arguments), _completion('{"a": 1, "b": 2}')]
+    )
+    assert metrics["total_count"] == 2
+    assert [r["is_correct"] for r in rows] == [False, True]
+    assert rows[0]["predicted_answer"] is None
 
 
-def test_reasoning_is_saved(tmp_path, monkeypatch):
-    _, rows = _run(tmp_path, monkeypatch, [_completion('{"a": 1, "b": 2}', reasoning="1+2")])
-    assert rows[0]["llm_reasoning_output"] == "1+2"
+def test_one_malformed_call_in_a_multi_call_reply(tmp_path, monkeypatch):
+    metrics, rows = _run(tmp_path, monkeypatch, [_completion('{"a": 1, "b": 2}', "{oops")])
+    assert metrics["unparsed_count"] == 1
+    assert len(rows[0]["tool_calls"]) == 2
+
+
+@pytest.mark.parametrize("arguments", ["", "   ", None])
+def test_missing_arguments_are_treated_as_no_arguments(tmp_path, monkeypatch, arguments):
+    _, rows = _run(tmp_path, monkeypatch, [_completion(arguments)])
+    assert json.loads(rows[0]["predicted_answer"])[0]["arguments"] == {}
+
+
+def test_dict_arguments_are_accepted(tmp_path, monkeypatch):
+    """部分供應商直接回傳 dict 而非 JSON 字串。"""
+    _, rows = _run(tmp_path, monkeypatch, [_completion({"a": 1, "b": 2})])
+    assert rows[0]["is_correct"] is True
+
+
+def test_missing_function_does_not_crash(tmp_path, monkeypatch):
+    completion = _completion('{"a": 1, "b": 2}')
+    completion.choices[0].message.tool_calls[0].function = None
+    metrics, rows = _run(tmp_path, monkeypatch, [completion])
+    assert rows[0]["is_correct"] is False
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [({"reasoning": "1+2"}, "1+2"), ({"reasoning_content": "legacy"}, "legacy")],
+)
+def test_reasoning_is_saved(tmp_path, monkeypatch, kwargs, expected):
+    _, rows = _run(tmp_path, monkeypatch, [_completion('{"a": 1, "b": 2}', **kwargs)])
+    assert rows[0]["llm_reasoning_output"] == expected
 
 
 def test_download_bfcl_merges_raw_files(tmp_path, monkeypatch):
@@ -124,8 +167,8 @@ def test_download_bfcl_merges_raw_files(tmp_path, monkeypatch):
 
     requested = []
 
-    def fake_download(repo_id, filename, repo_type=None, **kwargs):
-        requested.append((repo_id, filename, repo_type))
+    def fake_download(repo_id, filename, repo_type=None, revision=None, **kwargs):
+        requested.append((repo_id, filename, repo_type, revision))
         return str(raw / filename)
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
@@ -137,8 +180,35 @@ def test_download_bfcl_merges_raw_files(tmp_path, monkeypatch):
     assert sorted(os.listdir(out)) == sorted(f"{c}.jsonl" for c in categories)
     row = json.loads((out / "simple.jsonl").read_text())
     assert json.loads(row["answer"])["category"] == "simple"
+    revision = BENCHMARK_REGISTRY["bfcl"]["revision"]
     assert all(
-        r == ("gorilla-llm/Berkeley-Function-Calling-Leaderboard", r[1], "dataset")
+        r == ("gorilla-llm/Berkeley-Function-Calling-Leaderboard", r[1], "dataset", revision)
         for r in requested
     )
     assert len(requested) == 2 * len(categories)
+
+
+def test_download_bfcl_partial_failure_leaves_no_files(tmp_path, monkeypatch):
+    """中途某個類別下載失敗時，不得留下只有部分類別的資料集目錄。"""
+    import huggingface_hub
+
+    from twinkle_eval.benchmarks import download_benchmarks
+
+    raw = tmp_path / "raw"
+    (raw / "possible_answer").mkdir(parents=True)
+    (raw / "BFCL_v3_simple.json").write_text(
+        json.dumps({"id": "simple_0", "question": [[]], "function": []})
+    )
+    (raw / "possible_answer" / "BFCL_v3_simple.json").write_text(
+        json.dumps({"id": "simple_0", "ground_truth": []})
+    )
+
+    def fake_download(repo_id, filename, **kwargs):
+        if "simple" not in filename:
+            raise OSError("network down")
+        return str(raw / filename)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+
+    assert download_benchmarks(["bfcl"], str(tmp_path / "datasets")) == 1
+    assert os.listdir(tmp_path / "datasets" / "bfcl") == []
