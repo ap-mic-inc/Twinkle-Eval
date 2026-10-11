@@ -743,6 +743,9 @@ class Evaluator:
             for k, f in record["choice_futures"].items():
                 try:
                     score = f.result()
+                except NotImplementedError:
+                    # LLM 後端不支援 logit 評測是設定錯誤，不是 API 失敗，直接讓它浮出
+                    raise
                 except Exception as e:
                     log_error(f"問題 {question_id + 1} 選項 {k} API 呼叫失敗: {e}")
                     failed_choices.append(k)

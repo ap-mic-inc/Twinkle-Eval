@@ -194,6 +194,15 @@ class TestLogprobsPipeline:
         # 失敗題不寫入 JSONL（--resume 會重跑）
         assert [r["question_id"] for r in _read_rows(path)] == [1]
 
+    def test_unsupported_backend_surfaces_not_implemented(self, tmp_path):
+        """後端不支援 score_continuation 是設定錯誤，不得被當成 API 失敗吞掉。"""
+        data = _write_jsonl(tmp_path / "d.jsonl", self._ROWS)
+        llm = MagicMock()
+        llm.score_continuation.side_effect = NotImplementedError("no logit support")
+
+        with pytest.raises(NotImplementedError):
+            _evaluator(llm, "logit").evaluate_file(data, "ts_run0")
+
     def test_dead_endpoint_raises(self, tmp_path):
         """所有選項都是 -inf（端點掛掉或不支援 echo）時不得產生分數。"""
         data = _write_jsonl(tmp_path / "d.jsonl", self._ROWS)

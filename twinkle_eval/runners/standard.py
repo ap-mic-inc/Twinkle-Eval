@@ -325,6 +325,7 @@ class TwinkleEvalRunner:
         if export_formats is None:
             export_formats = ["json"]  # 預設輸出格式
 
+        self._resume_matched = False
         dataset_paths = self._get_dataset_paths()  # 取得資料集路徑
         dataset_results: Dict[str, Any] = {}  # 儲存所有資料集的結果
 

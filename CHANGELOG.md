@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **整檔 API 全部失敗時拋出 `EvaluationError`**，而不是回報 `accuracy = 0` 並被計入
   `repeat_runs` 的平均
 - **logprobs 路徑任一選項失敗即整題視為失敗**：`score_continuation()` 出錯時回傳 `-inf`，
-  先前會在其餘選項中挑答案並照常計分；所有選項都是 `-inf` 時則一律回答第一個選項
+  先前會在其餘選項中挑答案並照常計分
 - **`--resume` 先前從未跳過任何題目**：讀取已完成紀錄時比對的 `file` 欄位，evaluator 從未寫入。
   現在已完成的題目會跳過，其結果回填進統計，summary 涵蓋整個資料集；回填涵蓋
   `samples_per_question > 1` 的每個 sample，以及 IFEval（`prompt_loose`、`instruction_*`）與
