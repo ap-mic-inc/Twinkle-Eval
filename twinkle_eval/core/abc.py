@@ -50,8 +50,7 @@ class LLM(ABC):
         子類別應覆寫此方法以提供正確實作；預設拋出 NotImplementedError。
         """
         raise NotImplementedError(
-            f"{self.__class__.__name__} 尚未實作 score_continuation()，"
-            "無法使用 logit 評測策略。"
+            f"{self.__class__.__name__} 尚未實作 score_continuation()，" "無法使用 logit 評測策略。"
         )
 
 

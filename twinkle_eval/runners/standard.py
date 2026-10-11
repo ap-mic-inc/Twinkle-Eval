@@ -47,7 +47,9 @@ class TwinkleEvalRunner:
         """
         try:
             self.config = load_config(self.config_path)  # 載入配置
-            self.start_time = datetime.now().strftime("%Y%m%d_%H%M")  # 生成時間標記
+            self.start_time = datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )  # 生成時間標記（秒級，避免同分鐘的兩次評測互相覆蓋）
             self.start_datetime = datetime.now()  # 記錄開始時間
 
             os.makedirs(self.results_dir, exist_ok=True)  # 建立結果目錄
@@ -391,6 +393,17 @@ class TwinkleEvalRunner:
                 )
                 print(message)
                 log_info(message)
+
+                # 多資料集評測時，每完成一個就顯示累計成績，方便長時間評測中掌握進度
+                if len(dataset_paths) > 1:
+                    print(
+                        f"📊 累計成績（{len(dataset_results)}/{len(dataset_paths)} 個資料集完成）:"
+                    )
+                    for done_path, done_result in dataset_results.items():
+                        print(
+                            f"  {done_path}: {done_result['average_accuracy']:.2%} "
+                            f"(±{done_result['average_std']:.2%})"
+                        )
 
             except ImportError as e:
                 msg = f"\n❌ 資料集 {dataset_path} 評測失敗：缺少必要套件。\n   {e}\n"

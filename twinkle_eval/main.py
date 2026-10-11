@@ -58,6 +58,98 @@ def convert_json_to_html(json_file_path: str) -> int:
         return 1
 
 
+def convert_jsonl_to_excel(jsonl_path: str) -> int:
+    """將逐題結果 JSONL 檔案（eval_results_*.jsonl）轉換為 Excel 格式。
+
+    Args:
+        jsonl_path: JSONL 結果檔案的路徑
+
+    Returns:
+        int: 程式退出代碼（0 表示成功，1 表示失敗）
+    """
+    import json
+
+    try:
+        if not os.path.exists(jsonl_path):
+            print(f"❌ 檔案不存在: {jsonl_path}")
+            return 1
+
+        try:
+            import pandas as pd
+            from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+        except ImportError:
+            print("❌ 缺少 Excel 轉換所需套件，請執行: pip install twinkle-eval[excel]")
+            return 1
+
+        rows: list[dict] = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+
+        if not rows:
+            print(f"❌ 檔案沒有任何資料列: {jsonl_path}")
+            return 1
+
+        # Excel 單一儲存格上限 32767 字元；控制字元 openpyxl 會拒寫
+        excel_cell_limit = 32767
+        truncated = 0
+
+        def _to_cell(value: object) -> object:
+            nonlocal truncated
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False)
+            if isinstance(value, str):
+                value = ILLEGAL_CHARACTERS_RE.sub("", value)
+                if len(value) > excel_cell_limit:
+                    value = value[: excel_cell_limit - 1] + "…"
+                    truncated += 1
+            return value
+
+        rows = [{k: _to_cell(v) for k, v in row.items()} for row in rows]
+
+        # 常用欄位排前面，其餘欄位（各 benchmark 的額外指標）依出現順序附加在後
+        preferred = [
+            "file",
+            "question_id",
+            "sample_id",
+            "question",
+            "correct_answer",
+            "predicted_answer",
+            "is_correct",
+            "llm_output",
+            "llm_reasoning_output",
+            "usage_prompt_tokens",
+            "usage_completion_tokens",
+            "usage_total_tokens",
+        ]
+        all_keys: list[str] = []
+        for row in rows:
+            for k in row:
+                if k not in all_keys:
+                    all_keys.append(k)
+        columns = [k for k in preferred if k in all_keys] + [
+            k for k in all_keys if k not in preferred
+        ]
+
+        df = pd.DataFrame(rows, columns=columns)
+        output_path = os.path.splitext(jsonl_path)[0] + ".xlsx"
+        df.to_excel(output_path, index=False, engine="openpyxl")
+
+        print(f"✅ 成功轉換為 Excel: {output_path}（{len(df)} 列）")
+        if truncated:
+            print(f"⚠️  有 {truncated} 個儲存格超過 Excel 上限（{excel_cell_limit} 字元）已截斷")
+        return 0
+
+    except json.JSONDecodeError as e:
+        print(f"❌ JSONL 檔案格式錯誤: {e}")
+        return 1
+    except Exception as e:
+        print(f"❌ 轉換過程中發生錯誤: {e}")
+        return 1
+
+
 def get_available_templates() -> list[str]:
     """掃描 templates/ 目錄，回傳所有可用的 template 名稱（不含副檔名）。
 
@@ -202,10 +294,11 @@ def create_cli_parser() -> argparse.ArgumentParser:
   twinkle-eval --dry-run               # 預覽評測計畫（不呼叫 API）
 
 接續中斷的評測:
-  twinkle-eval --resume 20250401_1200  # 從指定時間戳記的中斷點繼續
+  twinkle-eval --resume 20250401_120000  # 從指定時間戳記的中斷點繼續
 
 結果格式轉換:
-  twinkle-eval --convert-to-html results_20240101_1200.json  # 將 JSON 結果轉換為 HTML
+  twinkle-eval --convert-to-html results_20240101_120000.json  # 將 JSON 結果轉換為 HTML
+  twinkle-eval --convert-to-excel eval_results_20240101_120000_run0.jsonl  # 將逐題 JSONL 轉換為 Excel
 
 效能基準測試:
   twinkle-eval --benchmark                           # 執行預設的基準測試
@@ -251,7 +344,7 @@ def create_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--validate",
         action="store_true",
-        help="僅驗證設定檔格式與資料集格式是否正確",
+        help="驗證設定檔與資料集格式，並對 API 端點做一次試打確認可連線",
     )
 
     parser.add_argument(
@@ -310,6 +403,12 @@ def create_cli_parser() -> argparse.ArgumentParser:
         "--convert-to-html",
         metavar="JSON_FILE",
         help="將 JSON 結果檔案轉換為 HTML 格式",
+    )
+
+    parser.add_argument(
+        "--convert-to-excel",
+        metavar="JSONL_FILE",
+        help="將逐題結果 JSONL 檔案轉換為 Excel 格式（需安裝 twinkle-eval[excel]）",
     )
 
     parser.add_argument(
@@ -497,7 +596,28 @@ def _handle_validate(config_path: str) -> int:
         except Exception as e:
             errors.append(f"資料集 {ds_path}：{e}")
 
-    # 4. 結果
+    # 4. 對 API 端點做一次試打，及早發現連線 / 金鑰 / 模型名稱錯誤
+    if not errors:
+        try:
+            live_config = load_config(config_path)
+            llm_type = live_config["llm_api"].get("type", "openai")
+            if llm_type == "whisper":
+                # whisper 後端的 call() 需要真實音檔，無法以文字試打
+                print("⏭️  whisper 後端不支援文字試打，略過 API 連線測試")
+            else:
+                llm_instance = live_config["llm_instance"]
+                # max_tokens 至少 16：Responses API 的 max_output_tokens 下限為 16
+                response = llm_instance.call(
+                    "ping",
+                    system_prompt_enabled=False,
+                    model_overrides={"max_tokens": 16},
+                )
+                model_name = getattr(response, "model", "") or live_config["model"]["name"]
+                print(f"✅ API 端點試打成功（模型: {model_name}）")
+        except Exception as e:
+            errors.append(f"API 端點試打失敗：{e}")
+
+    # 5. 結果
     if errors:
         print()
         for err in errors:
@@ -595,7 +715,7 @@ def _handle_resume(config_path: str, timestamp: str, export_formats: list[str]) 
 
     Args:
         config_path: 設定檔路徑
-        timestamp: 中斷時的時間戳記（如 20250401_1200）
+        timestamp: 中斷時的時間戳記（如 20250401_120000）
         export_formats: 輸出格式列表
 
     Returns:
@@ -780,6 +900,14 @@ def main() -> int:
     if args.convert_to_html:
         try:
             return convert_json_to_html(args.convert_to_html)
+        except Exception as e:
+            print(f"❌ 轉換失敗: {e}")
+            return 1
+
+    # JSONL 轉 Excel 命令
+    if args.convert_to_excel:
+        try:
+            return convert_jsonl_to_excel(args.convert_to_excel)
         except Exception as e:
             print(f"❌ 轉換失敗: {e}")
             return 1
